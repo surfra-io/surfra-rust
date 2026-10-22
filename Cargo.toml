@@ -1,0 +1,29 @@
+[package]
+name = "surfra"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Surfra SDK: volumes, apps and jobs on serverless GPUs across your own clouds"
+license = "Apache-2.0"
+repository = "https://github.com/surfra-io/surfra-rust"
+homepage = "https://surfra.io"
+documentation = "https://docs.surfra.io"
+readme = "README.md"
+keywords = ["gpu", "serverless", "inference", "storage", "ml"]
+categories = ["api-bindings", "filesystem"]
+
+[features]
+default = []
+# A synchronous API for code without an async runtime.
+blocking = ["tokio/rt", "tokio/net"]
+
+[dependencies]
+futures-util = "0.3"
+percent-encoding = "2.3"
+reqwest = { version = "0.13", features = ["json", "stream", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
