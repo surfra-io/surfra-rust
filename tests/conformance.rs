@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use surfra::{App, AppSpec, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
 
 const PART: u64 = 1024;
 
@@ -327,6 +327,24 @@ async fn a01_run_returns_the_output() {
         .await
         .unwrap();
     assert_eq!(output, json!({ "app": "embed", "echo": { "texts": ["hi"] } }));
+}
+
+#[tokio::test]
+async fn a06_submit_a_graph_and_wait() {
+    let Some(fake) = start() else { return };
+    let client = Client::with_settings(fake.settings());
+    let view = client
+        .submit(
+            json!([
+                { "name": "a", "app_name": "embed", "depends_on": [], "input": { "n": 1 } },
+                { "name": "b", "app_name": "rerank", "depends_on": ["a"], "input": {} }
+            ]),
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let out = Call::new(client, view).result(Some(Duration::from_secs(30))).await.unwrap();
+    assert_eq!(out, json!({ "a": { "app": "embed", "echo": { "n": 1 } }, "b": { "app": "rerank", "echo": {} } }));
 }
 
 #[tokio::test]

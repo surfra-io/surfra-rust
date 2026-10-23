@@ -262,6 +262,11 @@ pub struct Call {
 }
 
 impl Call {
+    /// Track a call from the view `Client::submit` returned.
+    pub fn new(client: Client, view: Value) -> Self {
+        Call { client, id: view["id"].as_str().unwrap_or_default().to_string(), view }
+    }
+
     /// Refresh and return the call's current view.
     pub async fn get(&mut self) -> Result<&Value> {
         self.view = self.client.call(Method::GET, &format!("/v1/transactions/{}", self.id), None).await?;
