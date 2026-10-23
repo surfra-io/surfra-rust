@@ -207,6 +207,15 @@ impl Workflow {
         Workflow { name: name.into(), client }
     }
 
+    /// Save the stages, such as `json!([{ "name": "summarize", "app": "summarize", "depends": ["transcribe"] }])`.
+    pub async fn deploy(&self, stages: Value) -> Result<Value> {
+        let route = format!(
+            "/v1/workflows/{}",
+            percent_encoding::utf8_percent_encode(&self.name, percent_encoding::NON_ALPHANUMERIC)
+        );
+        self.client.call(Method::PUT, &route, Some(&json!({ "stages": stages }))).await
+    }
+
     /// Start one run. Stages with no dependencies receive `input`.
     pub async fn enqueue(&self, input: Value) -> Result<Call> {
         let saved = self

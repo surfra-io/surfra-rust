@@ -455,6 +455,15 @@ async fn w01_workflow_run_returns_each_stage() {
 }
 
 #[tokio::test]
+async fn w02_workflow_deploy_saves_stages() {
+    let Some(fake) = start() else { return };
+    let flow = Workflow::with_client("solo", Client::with_settings(fake.settings()));
+    flow.deploy(json!([{ "name": "only", "app": "embed", "depends": [] }])).await.unwrap();
+    let out = flow.run(json!({ "q": "hi" }), Some(Duration::from_secs(30))).await.unwrap();
+    assert_eq!(out, json!({ "app": "embed", "echo": { "q": "hi" } }));
+}
+
+#[tokio::test]
 async fn j02_job_logs_oldest_first() {
     let Some(fake) = start() else { return };
     let spec = JobSpec {
