@@ -24,7 +24,7 @@ pub mod volumes;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 
-pub use client::{Call, Client, Job, JobSpec};
+pub use client::{App, AppSpec, Call, Client, Job, JobSpec, Workflow};
 pub use error::{Error, Result};
 pub use settings::Settings;
 pub use volumes::{Committed, Entry, Mode, Upload, Volume, VolumePath};

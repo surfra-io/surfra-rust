@@ -88,6 +88,17 @@ impl Settings {
         }
         Err(Error::Credential("no credential: set SURFRA_API_KEY or run `surfra login`".into()))
     }
+
+    /// The credential for control-plane calls: an explicit key, `SURFRA_API_KEY`, then the saved login.
+    /// Never the volumes token, which only the volumes service accepts.
+    pub fn control_credential(&self) -> Result<String> {
+        let control = Settings {
+            token_file: None,
+            replica_token: None,
+            ..self.clone()
+        };
+        control.credential()
+    }
 }
 
 impl Default for Settings {

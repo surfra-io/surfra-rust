@@ -232,7 +232,7 @@ impl Volume {
         let mut request = self
             .http
             .request(method, format!("{}{}", self.settings.master, route))
-            .bearer_auth(self.settings.credential()?);
+            .bearer_auth(self.settings.control_credential()?);
         if let Some(value) = &body {
             request = request.json(value);
         }
@@ -519,7 +519,7 @@ impl Volume {
 
     async fn sync(&self, path: &str, mode: Mode, refresh: bool) -> Result<PathBuf> {
         let root = self.root();
-        let target = root.join(path);
+        let target = root.join(path.trim_end_matches('/'));
         let mut synced = self.synced.lock().await;
         if let Some(previous) = synced.get(path).copied() {
             if !refresh {

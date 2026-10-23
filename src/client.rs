@@ -33,19 +33,43 @@ impl Client {
         let mut request = self
             .http
             .request(method, format!("{}{}", self.settings.master, route))
-            .bearer_auth(self.settings.credential()?);
+            .bearer_auth(self.settings.control_credential()?);
         if let Some(value) = body {
             request = request.json(value);
         }
         Ok(checked(request.send().await?).await?.json().await?)
     }
 
+    /// Start a transaction. Over the organization's request rate, waits as Surfra asks, up to five times.
+    pub async fn submit(&self, stages: Value, metadata: Value) -> Result<Value> {
+        let body = json!({ "stages": stages, "metadata": metadata });
+        for attempt in 0..=RATE_RETRIES {
+            let response = self
+                .http
+                .post(format!("{}/v1/transactions", self.settings.master))
+                .bearer_auth(self.settings.control_credential()?)
+                .json(&body)
+                .send()
+                .await?;
+            if response.status().as_u16() != 429 || attempt == RATE_RETRIES {
+                return Ok(checked(response).await?.json().await?);
+            }
+            let wait = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(1.0)
+                .clamp(1.0, 60.0);
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
     /// Queue one call to an app and return it before the app finishes.
     pub async fn enqueue(&self, app: &str, input: Value) -> Result<Call> {
         let stages = json!([{ "name": "call", "app_name": app, "depends_on": [], "input": input }]);
-        let view = self
-            .call(Method::POST, "/v1/transactions", Some(&json!({ "stages": stages, "metadata": {} })))
-            .await?;
+        let view = self.submit(stages, json!({})).await?;
         Ok(Call {
             client: self.clone(),
             id: view["id"].as_str().unwrap_or_default().to_string(),
@@ -84,6 +108,140 @@ impl Client {
 impl Default for Client {
     fn default() -> Self {
         Client::new()
+    }
+}
+
+const RATE_RETRIES: u32 = 5;
+
+/// A deployed app by name. No request is made until it is used.
+#[derive(Clone)]
+pub struct App {
+    pub name: String,
+    client: Client,
+}
+
+/// What an app runs, for [`App::deploy`]. `runtime` is `{"engine": "python"}` or `{"engine": "http", "port": 8000}`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AppSpec {
+    pub image: String,
+    pub entrypoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Machine rows, replicas and scaling, as in the docs' autoscale reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub autoscale: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<Value>,
+}
+
+impl App {
+    pub fn new(name: impl Into<String>) -> Self {
+        App::with_client(name, Client::new())
+    }
+
+    pub fn with_client(name: impl Into<String>, client: Client) -> Self {
+        App { name: name.into(), client }
+    }
+
+    fn route(&self, rest: &str) -> String {
+        format!(
+            "/v1/apps/{}{rest}",
+            percent_encoding::utf8_percent_encode(&self.name, percent_encoding::NON_ALPHANUMERIC)
+        )
+    }
+
+    /// Create the app, or update the app with this name. Returns the saved app with its `sfa_` id.
+    pub async fn deploy(&self, spec: &AppSpec) -> Result<Value> {
+        let mut body = serde_json::to_value(spec).expect("a spec is JSON");
+        for (key, empty) in [("env", json!({})), ("autoscale", json!({}))] {
+            body.as_object_mut().unwrap().entry(key).or_insert(empty);
+        }
+        self.client.call(Method::PUT, &self.route(""), Some(&body)).await
+    }
+
+    /// The saved app: image, entrypoint, runtime and autoscale.
+    pub async fn info(&self) -> Result<Value> {
+        self.client.call(Method::GET, &self.route(""), None).await
+    }
+
+    /// Queue one request and return it before the app finishes.
+    pub async fn enqueue(&self, input: Value) -> Result<Call> {
+        self.client.enqueue(&self.name, input).await
+    }
+
+    /// Call the app and wait for its output.
+    pub async fn run(&self, input: Value, timeout: Option<Duration>) -> Result<Value> {
+        self.client.run(&self.name, input, timeout).await
+    }
+
+    /// The volumes this app's replicas may reach, as `[{"volume", "mode"}]`.
+    pub async fn volumes(&self) -> Result<Value> {
+        Ok(self.client.call(Method::GET, &self.route("/volumes"), None).await?["volumes"].clone())
+    }
+
+    /// Replace the app's volumes, such as `["weights:r", "outputs:rw"]`.
+    pub async fn set_volumes(&self, volumes: &[&str]) -> Result<Value> {
+        Ok(self
+            .client
+            .call(Method::PUT, &self.route("/volumes"), Some(&json!({ "volumes": volumes })))
+            .await?["volumes"]
+            .clone())
+    }
+}
+
+/// A saved workflow by name.
+#[derive(Clone)]
+pub struct Workflow {
+    pub name: String,
+    client: Client,
+}
+
+impl Workflow {
+    pub fn new(name: impl Into<String>) -> Self {
+        Workflow::with_client(name, Client::new())
+    }
+
+    pub fn with_client(name: impl Into<String>, client: Client) -> Self {
+        Workflow { name: name.into(), client }
+    }
+
+    /// Start one run. Stages with no dependencies receive `input`.
+    pub async fn enqueue(&self, input: Value) -> Result<Call> {
+        let saved = self
+            .client
+            .call(
+                Method::GET,
+                &format!(
+                    "/v1/workflows/{}",
+                    percent_encoding::utf8_percent_encode(&self.name, percent_encoding::NON_ALPHANUMERIC)
+                ),
+                None,
+            )
+            .await?;
+        let stages: Vec<Value> = saved["stages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                let depends = row["depends"].as_array().cloned().unwrap_or_default();
+                let stage_input = if depends.is_empty() { input.clone() } else { json!({}) };
+                json!({ "name": row["name"], "app_name": row["app"], "depends_on": depends, "input": stage_input })
+            })
+            .collect();
+        let view = self.client.submit(Value::Array(stages), json!({ "workflow": self.name })).await?;
+        Ok(Call {
+            client: self.client.clone(),
+            id: view["id"].as_str().unwrap_or_default().to_string(),
+            view,
+        })
+    }
+
+    /// Start one run and wait. Returns `{stage name: output}`, or the output for a single stage.
+    pub async fn run(&self, input: Value, timeout: Option<Duration>) -> Result<Value> {
+        self.enqueue(input).await?.result(timeout).await
     }
 }
 
@@ -188,6 +346,31 @@ impl Job {
     pub async fn stop(&mut self) -> Result<&Value> {
         self.view = self.client.call(Method::POST, &format!("/v1/jobs/{}/stop", self.id), Some(&json!({}))).await?;
         Ok(&self.view)
+    }
+
+    /// The job's log lines after `after` (a timestamp from an earlier line), oldest first, as `{"t", "s", "m"}`.
+    pub async fn logs(&self, after: Option<&str>) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut cursor = after.map(str::to_string);
+        loop {
+            let mut route = format!("/v1/jobs/{}/logs?limit=1000&order=asc", self.id);
+            if let Some(stamp) = &cursor {
+                route.push_str(&format!(
+                    "&after={}",
+                    percent_encoding::utf8_percent_encode(stamp, percent_encoding::NON_ALPHANUMERIC)
+                ));
+            }
+            let page = self.client.call(Method::GET, &route, None).await?;
+            let lines = page["lines"].as_array().cloned().unwrap_or_default();
+            let full = lines.len() >= 1000;
+            if let Some(last) = lines.last().and_then(|line| line["t"].as_str()) {
+                cursor = Some(last.to_string());
+            }
+            out.extend(lines);
+            if !full {
+                return Ok(out);
+            }
+        }
     }
 
     /// Wait until the job ends: succeeded, failed, stopped or lost.

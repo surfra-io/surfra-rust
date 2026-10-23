@@ -154,3 +154,65 @@ impl Default for Client {
         Client::new()
     }
 }
+
+/// A deployed app by name. See [`crate::App`].
+pub struct App {
+    inner: crate::App,
+    rt: Arc<Runtime>,
+}
+
+impl App {
+    pub fn new(name: impl Into<String>) -> Self {
+        App::with_settings(name, Settings::from_env())
+    }
+
+    pub fn with_settings(name: impl Into<String>, settings: Settings) -> Self {
+        App {
+            inner: crate::App::with_client(name, crate::Client::with_settings(settings)),
+            rt: runtime(),
+        }
+    }
+
+    pub fn deploy(&self, spec: &crate::AppSpec) -> Result<Value> {
+        self.rt.block_on(self.inner.deploy(spec))
+    }
+
+    pub fn info(&self) -> Result<Value> {
+        self.rt.block_on(self.inner.info())
+    }
+
+    pub fn run(&self, input: Value, timeout: Option<Duration>) -> Result<Value> {
+        self.rt.block_on(self.inner.run(input, timeout))
+    }
+
+    pub fn volumes(&self) -> Result<Value> {
+        self.rt.block_on(self.inner.volumes())
+    }
+
+    pub fn set_volumes(&self, volumes: &[&str]) -> Result<Value> {
+        self.rt.block_on(self.inner.set_volumes(volumes))
+    }
+}
+
+/// A saved workflow by name. See [`crate::Workflow`].
+pub struct Workflow {
+    inner: crate::Workflow,
+    rt: Arc<Runtime>,
+}
+
+impl Workflow {
+    pub fn new(name: impl Into<String>) -> Self {
+        Workflow::with_settings(name, Settings::from_env())
+    }
+
+    pub fn with_settings(name: impl Into<String>, settings: Settings) -> Self {
+        Workflow {
+            inner: crate::Workflow::with_client(name, crate::Client::with_settings(settings)),
+            rt: runtime(),
+        }
+    }
+
+    pub fn run(&self, input: Value, timeout: Option<Duration>) -> Result<Value> {
+        self.rt.block_on(self.inner.run(input, timeout))
+    }
+}

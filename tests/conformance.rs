@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use surfra::{Client, Error, JobSpec, Mode, Settings, Volume};
+use surfra::{App, AppSpec, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
 
 const PART: u64 = 1024;
 
@@ -357,4 +357,119 @@ async fn j01_job_with_volumes_finishes() {
     let view = job.wait(Duration::from_millis(50), Some(Duration::from_secs(30))).await.unwrap().clone();
     assert_eq!(view["status"], "succeeded");
     assert_eq!(view["exit_code"], 0);
+}
+
+#[tokio::test]
+async fn v15_write_and_read_helpers() {
+    let Some(fake) = start() else { return };
+    let weights = fake.volume("weights").await;
+    weights.write("bytes.bin", vec![0u8, 1, b'r', b'a', b'w']).await.unwrap();
+    assert_eq!(weights.read("bytes.bin").await.unwrap(), vec![0u8, 1, b'r', b'a', b'w']);
+}
+
+#[tokio::test]
+async fn c01_control_plane_calls_skip_the_volumes_token() {
+    let Some(fake) = start() else { return };
+    let dir = temp("c01");
+    std::fs::write(dir.join("token"), "aaa.bbb.ccc").unwrap();
+    let settings = Settings {
+        token_file: Some(dir.join("token")),
+        ..fake.settings()
+    };
+    let weights = Volume::with_settings("weights", settings.clone());
+    weights.create().await.unwrap();
+    weights.ls("", false).await.unwrap();
+    Client::with_settings(settings)
+        .run("embed", json!({}), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let sent: std::collections::HashMap<String, String> = fake
+        .requests()
+        .await
+        .into_iter()
+        .map(|item| (item["path"].as_str().unwrap().to_string(), item["auth"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert_eq!(sent["/v1/volumes"], "Bearer sfk_test");
+    assert_eq!(sent["/v1/transactions"], "Bearer sfk_test");
+    assert_eq!(sent["/v1/weights/list"], "Bearer aaa.bbb.ccc");
+}
+
+#[tokio::test]
+async fn a03_app_deploy_sends_the_spec() {
+    let Some(fake) = start() else { return };
+    let app = App::with_client("embed", Client::with_settings(fake.settings()));
+    let spec = AppSpec {
+        image: "ghcr.io/acme/embed:1".into(),
+        entrypoint: "app.py".into(),
+        autoscale: Some(json!({ "max_replicas": 2 })),
+        runtime: Some(json!({ "engine": "python" })),
+        ..Default::default()
+    };
+    let saved = app.deploy(&spec).await.unwrap();
+    assert_eq!(saved["name"], "embed");
+    assert!(saved["id"].as_str().unwrap().starts_with("sfa_"));
+    assert_eq!(saved["image"], "ghcr.io/acme/embed:1");
+    assert_eq!(saved["autoscale"], json!({ "max_replicas": 2 }));
+    assert!(
+        fake.requests()
+            .await
+            .iter()
+            .any(|item| item["method"] == "PUT" && item["path"] == "/v1/apps/embed")
+    );
+}
+
+#[tokio::test]
+async fn a04_app_run_and_volumes() {
+    let Some(fake) = start() else { return };
+    let app = App::with_client("embed", Client::with_settings(fake.settings()));
+    assert_eq!(
+        app.run(json!({ "x": 1 }), Some(Duration::from_secs(30))).await.unwrap(),
+        json!({ "app": "embed", "echo": { "x": 1 } })
+    );
+    app.set_volumes(&["weights:r"]).await.unwrap();
+    assert_eq!(app.volumes().await.unwrap(), json!([{ "volume": "weights", "mode": "r" }]));
+}
+
+#[tokio::test]
+async fn a05_a_rate_limited_submit_waits_and_succeeds() {
+    let Some(fake) = start() else { return };
+    let output = Client::with_settings(fake.settings())
+        .run("busy", json!({ "n": 1 }), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert_eq!(output, json!({ "app": "busy", "echo": { "n": 1 } }));
+    assert_eq!(fake.requests().await.iter().filter(|item| item["path"] == "/v1/transactions").count(), 2);
+}
+
+#[tokio::test]
+async fn w01_workflow_run_returns_each_stage() {
+    let Some(fake) = start() else { return };
+    let out = Workflow::with_client("pipeline", Client::with_settings(fake.settings()))
+        .run(json!({ "q": "hi" }), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        json!({ "a": { "app": "embed", "echo": { "q": "hi" } }, "b": { "app": "rerank", "echo": {} } })
+    );
+}
+
+#[tokio::test]
+async fn j02_job_logs_oldest_first() {
+    let Some(fake) = start() else { return };
+    let spec = JobSpec {
+        entrypoint: Some("echo hi".into()),
+        image: Some("img".into()),
+        providers: vec![json!({ "provider": "local" })],
+        ..Default::default()
+    };
+    let job = Client::with_settings(fake.settings()).submit_job(&spec).await.unwrap();
+    let lines: Vec<String> = job
+        .logs(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|line| line["m"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(lines, vec!["line 0", "line 1", "line 2"]);
 }
