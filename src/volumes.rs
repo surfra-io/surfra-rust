@@ -544,10 +544,11 @@ impl Volume {
             .filter(|entry| stale(&root.join(&entry.path), state.get(&entry.path), entry))
             .cloned()
             .collect();
-        stream::iter(changed.iter())
-            .map(|entry| {
-                let target = root.join(&entry.path);
-                async move { self.download_to(&entry.path, &target).await }
+        // Owned paths, so the future stays `Send` (a borrowed item trips rustc's higher-ranked inference).
+        stream::iter(changed.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>())
+            .map(|remote| {
+                let target = root.join(&remote);
+                async move { self.download_to(&remote, &target).await }
             })
             .buffer_unordered(DOWNLOADS)
             .try_collect::<Vec<_>>()

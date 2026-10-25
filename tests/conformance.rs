@@ -1,14 +1,24 @@
 //! The shared SDK cases (surfra-sdk-tests/CASES.md), each against its own copy of the fake server.
 //!
 //! Set SURFRA_SDK_TESTS to the suite's folder; a sibling checkout is found on its own. Skipped when absent.
+//!
+//! Every case is written once, in `cases!`, and expanded per mode, so the async and blocking APIs run
+//! the same cases by construction:
+//!
+//! - `async_cases`: `surfra::*` under `#[tokio::test]`;
+//! - `blocking_cases`: `surfra::blocking::*` under `#[test]` (feature `blocking`);
+//! - `blocking_in_current_thread` / `blocking_in_multi_thread`: the blocking API called from inside a
+//!   Tokio runtime of each flavor, which must not panic (feature `blocking`).
+//!
+//! Inside a case, `call!(expr)` is an SDK call: `expr.await` in async mode, `expr` in blocking mode.
+//! The fake server's own helpers are synchronous in every mode.
 
+use std::future::Future;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 use serde_json::{Value, json};
-use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
 
 const PART: u64 = 1024;
 
@@ -16,7 +26,6 @@ struct Fake {
     url: String,
     cache: PathBuf,
     child: Child,
-    http: reqwest::Client,
 }
 
 impl Drop for Fake {
@@ -56,17 +65,22 @@ fn start() -> Option<Fake> {
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    Some(Fake {
-        url,
-        cache,
-        child,
-        http: reqwest::Client::new(),
+    Some(Fake { url, cache, child })
+}
+
+/// Run a test-side request to completion from any thread, inside a runtime or not.
+fn side<T: Send>(future: impl Future<Output = T> + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future))
+            .join()
+            .unwrap()
     })
 }
 
 impl Fake {
-    fn settings(&self) -> Settings {
-        Settings {
+    fn settings(&self) -> surfra::Settings {
+        surfra::Settings {
             api_key: None,
             master: self.url.clone(),
             volumes_url: self.url.clone(),
@@ -79,32 +93,40 @@ impl Fake {
         }
     }
 
-    async fn volume(&self, name: &str) -> Volume {
-        self.http
-            .post(format!("{}/v1/volumes", self.url))
-            .bearer_auth("sfk_test")
-            .json(&json!({ "name": name }))
-            .send()
-            .await
-            .unwrap();
-        Volume::with_settings(name, self.settings())
+    fn post(&self, route: &str, auth: Option<&str>, body: Value) {
+        side(async {
+            let mut request = reqwest::Client::new().post(format!("{}{route}", self.url)).json(&body);
+            if let Some(token) = auth {
+                request = request.bearer_auth(token);
+            }
+            request.send().await.unwrap();
+        })
     }
 
-    async fn seed(&self, volume: &str, path: &str, body: &str) {
-        self.http
-            .post(format!("{}/_test/files", self.url))
-            .json(&json!({ "volume": volume, "path": path, "body": body }))
-            .send()
-            .await
-            .unwrap();
+    /// Create a volume on the fake, as the server, and return nothing; cases build their own handle.
+    fn make_volume(&self, name: &str) {
+        self.post("/v1/volumes", Some("sfk_test"), json!({ "name": name }));
     }
 
-    async fn state(&self) -> Value {
-        self.http.get(format!("{}/_test/state", self.url)).send().await.unwrap().json().await.unwrap()
+    fn seed(&self, volume: &str, path: &str, body: &str) {
+        self.post("/_test/files", None, json!({ "volume": volume, "path": path, "body": body }));
     }
 
-    async fn requests(&self) -> Vec<Value> {
-        self.state().await["log"]
+    fn state(&self) -> Value {
+        side(async {
+            reqwest::Client::new()
+                .get(format!("{}/_test/state", self.url))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        })
+    }
+
+    fn requests(&self) -> Vec<Value> {
+        self.state()["log"]
             .as_array()
             .unwrap()
             .iter()
@@ -115,388 +137,493 @@ impl Fake {
 }
 
 fn temp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("surfra-rust-src-{}-{name}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "surfra-rust-src-{}-{name}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-#[tokio::test]
-async fn v01_small_upload_round_trips() {
-    let Some(fake) = start() else { return };
-    let weights = fake.volume("weights").await;
-    weights.write("a.txt", "hello").await.unwrap();
-    assert_eq!(weights.read("a.txt").await.unwrap(), b"hello");
-    assert!(!fake.requests().await.iter().any(|item| item["path"].as_str().unwrap().ends_with("/uploads")));
+/// Every case, once. `$case` declares one test in the mode's style; `$call` marks an SDK call.
+macro_rules! cases {
+    ($case:ident, $call:ident) => {
+        $case!(v01_small_upload_round_trips, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            $call!(weights.write("a.txt", "hello")).unwrap();
+            assert_eq!($call!(weights.read("a.txt")).unwrap(), b"hello");
+            assert!(!fake.requests().iter().any(|item| item["path"].as_str().unwrap().ends_with("/uploads")));
+        });
+
+        $case!(v02_large_upload_goes_in_parts, {
+            let Some(fake) = start() else { return };
+            let dir = temp("v02");
+            let data: Vec<u8> = (0..(PART * 3 + 17)).map(|n| (n * 7 % 251) as u8).collect();
+            std::fs::write(dir.join("big.bin"), &data).unwrap();
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            $call!(weights.put_file(dir.join("big.bin"), "big.bin")).unwrap();
+            assert_eq!($call!(weights.read("big.bin")).unwrap(), data);
+            assert!(fake.requests().iter().any(|item| item["path"].as_str().unwrap().ends_with("/uploads")));
+        });
+
+        $case!(v03_put_directory_keeps_relative_paths, {
+            let Some(fake) = start() else { return };
+            let dir = temp("v03");
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("a"), "a").unwrap();
+            std::fs::write(dir.join("sub/b"), "b").unwrap();
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            assert_eq!($call!(weights.put_directory(&dir, "minilm/")).unwrap(), 2);
+            let files = fake.state()["files"]["weights"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            assert_eq!(files, vec!["minilm/a", "minilm/sub/b"]);
+        });
+
+        $case!(v04_ls_lists_one_level_or_everything, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            for path in ["m/a", "m/sub/b", "top"] {
+                fake.seed("weights", path, "x");
+            }
+            let top: Vec<String> = $call!(weights.ls("m/", false)).unwrap().into_iter().map(|entry| entry.path).collect();
+            assert_eq!(top, vec!["m/a", "m/sub/"]);
+            let mut all: Vec<String> = $call!(weights.ls("", true)).unwrap().into_iter().map(|entry| entry.path).collect();
+            all.sort();
+            assert_eq!(all, vec!["m/a", "m/sub/b", "top"]);
+        });
+
+        $case!(v05_local_downloads_once, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            fake.seed("weights", "m/a", "aaa");
+            fake.seed("weights", "m/b", "bbb");
+            let path = $call!(weights.path("m/").local()).unwrap();
+            assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "aaa");
+            assert_eq!(std::fs::read_to_string(path.join("b")).unwrap(), "bbb");
+            let before = fake.requests().len();
+            $call!(weights.path("m/").local()).unwrap();
+            assert_eq!(fake.requests().len(), before);
+        });
+
+        $case!(v06_a_new_object_fetches_only_changes, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            fake.seed("weights", "m/a", "aaa");
+            fake.seed("weights", "m/b", "bbb");
+            $call!(Volume::with_settings("weights", fake.settings()).path("m/").local()).unwrap();
+            fake.seed("weights", "m/a", "AAAA");
+            fake.post("/v1/weights/delete", Some("sfk_test"), json!({ "paths": ["m/b"] }));
+            let downloads = fake.state()["downloads"].as_u64().unwrap();
+            let path = $call!(Volume::with_settings("weights", fake.settings()).path("m/").local()).unwrap();
+            assert_eq!(fake.state()["downloads"].as_u64().unwrap(), downloads + 1);
+            assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "AAAA");
+            assert!(!path.join("b").exists());
+        });
+
+        $case!(v07_commit_uploads_changes_and_deletes, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("ckpts");
+            let ckpts = Volume::with_settings("ckpts", fake.settings());
+            for path in ["r/a", "r/b", "r/c"] {
+                fake.seed("ckpts", path, path);
+            }
+            let folder = $call!(ckpts.path("r/").local_with(Mode::ReadWrite, false)).unwrap();
+            std::fs::write(folder.join("a"), "changed!").unwrap();
+            std::fs::write(folder.join("d"), "new").unwrap();
+            std::fs::remove_file(folder.join("c")).unwrap();
+            let done = $call!(ckpts.commit()).unwrap();
+            assert_eq!((done.uploaded, done.deleted), (2, 1));
+            let files = fake.state()["files"]["ckpts"].clone();
+            assert_eq!(files.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), vec!["r/a", "r/b", "r/d"]);
+            assert_eq!(files["r/a"]["body"], "changed!");
+            let again = $call!(ckpts.commit()).unwrap();
+            assert_eq!((again.uploaded, again.deleted), (0, 0));
+        });
+
+        $case!(v08_open_write_uploads_on_close_only, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("results");
+            let results = Volume::with_settings("results", fake.settings());
+            let mut done = results.writer("runs/1.jsonl");
+            done.write_all(b"one\n");
+            $call!(done.finish()).unwrap();
+            {
+                let mut abandoned = results.writer("runs/2.jsonl");
+                abandoned.write_all(b"partial");
+                // Dropped without finish: nothing is uploaded.
+            }
+            let files = fake.state()["files"]["results"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            assert_eq!(files, vec!["runs/1.jsonl"]);
+        });
+
+        $case!(v09_rm_file_and_folder, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            for path in ["a", "old/x", "old/y"] {
+                fake.seed("weights", path, "x");
+            }
+            $call!(weights.rm("a")).unwrap();
+            assert_eq!($call!(weights.rm_recursive("old/")).unwrap(), 2);
+            assert!(fake.state()["files"]["weights"].as_object().unwrap().is_empty());
+        });
+
+        $case!(v10_missing_file_raises_404, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            match $call!(Volume::with_settings("weights", fake.settings()).read("nope")) {
+                Err(Error::Api { status: 404, detail }) => assert!(detail.contains("no such file")),
+                other => panic!("expected a 404, got {other:?}"),
+            }
+        });
+
+        $case!(v11_token_file_wins_over_the_api_key, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let dir = temp("v11");
+            std::fs::write(dir.join("token"), "aaa.bbb.ccc\n").unwrap();
+            let settings = Settings {
+                token_file: Some(dir.join("token")),
+                ..fake.settings()
+            };
+            $call!(Volume::with_settings("weights", settings).ls("", false)).unwrap();
+            assert_eq!(fake.requests().last().unwrap()["auth"], "Bearer aaa.bbb.ccc");
+        });
+
+        $case!(v12_no_credential_says_what_to_set, {
+            let Some(fake) = start() else { return };
+            let settings = Settings {
+                env_api_key: None,
+                ..fake.settings()
+            };
+            match $call!(Volume::with_settings("weights", settings).ls("", false)) {
+                Err(error @ Error::Credential(_)) => assert!(error.to_string().contains("SURFRA_API_KEY")),
+                other => panic!("expected a credential error, got {other:?}"),
+            }
+        });
+
+        $case!(v13_writing_to_a_new_volume_creates_it, {
+            let Some(fake) = start() else { return };
+            $call!(Volume::with_settings("fresh", fake.settings()).write("a.txt", "x")).unwrap();
+            assert_eq!(fake.state()["files"]["fresh"]["a.txt"]["body"], "x");
+        });
+
+        $case!(v14_another_sdks_state_file_is_honored, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            fake.seed("weights", "m/a", "aaa");
+            let local = fake.cache.join("vol-weights/m/a");
+            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            std::fs::write(&local, "aaa").unwrap();
+            let meta = std::fs::metadata(&local).unwrap();
+            let mtime_ns = {
+                use std::os::unix::fs::MetadataExt;
+                meta.mtime() as u64 * 1_000_000_000 + meta.mtime_nsec() as u64
+            };
+            let etag = fake.state()["files"]["weights"]["m/a"]["etag"].clone();
+            std::fs::create_dir_all(fake.cache.join(".state")).unwrap();
+            std::fs::write(
+                fake.cache.join(".state/vol-weights.json"),
+                json!({ "m/a": { "etag": etag, "size": 3, "mtime_ns": mtime_ns } }).to_string(),
+            )
+            .unwrap();
+            $call!(Volume::with_settings("weights", fake.settings()).path("m/").local()).unwrap();
+            assert_eq!(fake.state()["downloads"], 0);
+        });
+
+        $case!(v15_write_and_read_helpers, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            let weights = Volume::with_settings("weights", fake.settings());
+            $call!(weights.write("bytes.bin", vec![0u8, 1, b'r', b'a', b'w'])).unwrap();
+            assert_eq!($call!(weights.read("bytes.bin")).unwrap(), vec![0u8, 1, b'r', b'a', b'w']);
+        });
+
+        $case!(c01_control_plane_calls_skip_the_volumes_token, {
+            let Some(fake) = start() else { return };
+            let dir = temp("c01");
+            std::fs::write(dir.join("token"), "aaa.bbb.ccc").unwrap();
+            let settings = Settings {
+                token_file: Some(dir.join("token")),
+                ..fake.settings()
+            };
+            let weights = Volume::with_settings("weights", settings.clone());
+            $call!(weights.create()).unwrap();
+            $call!(weights.ls("", false)).unwrap();
+            $call!(Client::with_settings(settings).run("embed", json!({}), Some(Duration::from_secs(30)))).unwrap();
+            let sent: std::collections::HashMap<String, String> = fake
+                .requests()
+                .into_iter()
+                .map(|item| (item["path"].as_str().unwrap().to_string(), item["auth"].as_str().unwrap_or("").to_string()))
+                .collect();
+            assert_eq!(sent["/v1/volumes"], "Bearer sfk_test");
+            assert_eq!(sent["/v1/transactions"], "Bearer sfk_test");
+            assert_eq!(sent["/v1/weights/list"], "Bearer aaa.bbb.ccc");
+        });
+
+        $case!(a01_run_returns_the_output, {
+            let Some(fake) = start() else { return };
+            let output = $call!(Client::with_settings(fake.settings()).run("embed", json!({ "texts": ["hi"] }), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(output, json!({ "app": "embed", "echo": { "texts": ["hi"] } }));
+        });
+
+        $case!(a02_enqueue_then_result, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let call = $call!(client.enqueue("embed", json!({ "n": 1 }))).unwrap();
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": { "n": 1 } }));
+            let failed = $call!($call!(client.enqueue("fails", json!({}))).unwrap().result(Some(Duration::from_secs(30))));
+            assert!(matches!(failed, Err(Error::Failed(reason)) if reason.contains("ValueError")));
+        });
+
+        $case!(a03_app_deploy_sends_the_spec, {
+            let Some(fake) = start() else { return };
+            let app = App::with_client("embed", Client::with_settings(fake.settings()));
+            let spec = AppSpec {
+                image: "ghcr.io/acme/embed:1".into(),
+                entrypoint: "app.py".into(),
+                autoscale: Some(json!({ "max_replicas": 2 })),
+                runtime: Some(json!({ "engine": "python" })),
+                ..Default::default()
+            };
+            let saved = $call!(app.deploy(&spec)).unwrap();
+            assert_eq!(saved["name"], "embed");
+            assert!(saved["id"].as_str().unwrap().starts_with("sfa_"));
+            assert_eq!(saved["image"], "ghcr.io/acme/embed:1");
+            assert_eq!(saved["autoscale"], json!({ "max_replicas": 2 }));
+            assert!(fake.requests().iter().any(|item| item["method"] == "PUT" && item["path"] == "/v1/apps/embed"));
+        });
+
+        $case!(a04_app_run_and_volumes, {
+            let Some(fake) = start() else { return };
+            let app = App::with_client("embed", Client::with_settings(fake.settings()));
+            assert_eq!($call!(app.run(json!({ "x": 1 }), Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": { "x": 1 } }));
+            $call!(app.set_volumes(&["weights:r"])).unwrap();
+            assert_eq!($call!(app.volumes()).unwrap(), json!([{ "volume": "weights", "mode": "r" }]));
+        });
+
+        $case!(a05_a_rate_limited_submit_waits_and_succeeds, {
+            let Some(fake) = start() else { return };
+            let output = $call!(Client::with_settings(fake.settings()).run("busy", json!({ "n": 1 }), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(output, json!({ "app": "busy", "echo": { "n": 1 } }));
+            assert_eq!(fake.requests().iter().filter(|item| item["path"] == "/v1/transactions").count(), 2);
+        });
+
+        $case!(a06_submit_a_graph_and_wait, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let view = $call!(client.submit(
+                json!([
+                    { "name": "a", "app_name": "embed", "depends_on": [], "input": { "n": 1 } },
+                    { "name": "b", "app_name": "rerank", "depends_on": ["a"], "input": {} }
+                ]),
+                json!({}),
+            ))
+            .unwrap();
+            let out = $call!(Call::new(client, view).result(Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(out, json!({ "a": { "app": "embed", "echo": { "n": 1 } }, "b": { "app": "rerank", "echo": {} } }));
+        });
+
+        $case!(w01_workflow_run_returns_each_stage, {
+            let Some(fake) = start() else { return };
+            let out = $call!(Workflow::with_client("pipeline", Client::with_settings(fake.settings())).run(json!({ "q": "hi" }), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(out, json!({ "a": { "app": "embed", "echo": { "q": "hi" } }, "b": { "app": "rerank", "echo": {} } }));
+        });
+
+        $case!(w02_workflow_deploy_saves_stages, {
+            let Some(fake) = start() else { return };
+            let flow = Workflow::with_client("solo", Client::with_settings(fake.settings()));
+            $call!(flow.deploy(json!([{ "name": "only", "app": "embed", "depends": [] }]))).unwrap();
+            let out = $call!(flow.run(json!({ "q": "hi" }), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(out, json!({ "app": "embed", "echo": { "q": "hi" } }));
+        });
+
+        $case!(j01_job_with_volumes_finishes, {
+            let Some(fake) = start() else { return };
+            let spec = JobSpec {
+                entrypoint: Some("python train.py".into()),
+                image: Some("img".into()),
+                providers: vec![json!({ "provider": "local" })],
+                volumes: vec![Volume::new("weights").grant(Mode::Read)],
+                ..Default::default()
+            };
+            let mut job = $call!(Client::with_settings(fake.settings()).submit_job(&spec)).unwrap();
+            assert_eq!(fake.state()["jobs"][&job.id]["volumes"], json!(["weights:r"]));
+            let view = $call!(job.wait(Duration::from_millis(50), Some(Duration::from_secs(30)))).unwrap().clone();
+            assert_eq!(view["status"], "succeeded");
+            assert_eq!(view["exit_code"], 0);
+        });
+
+        $case!(j02_job_logs_oldest_first, {
+            let Some(fake) = start() else { return };
+            let spec = JobSpec {
+                entrypoint: Some("echo hi".into()),
+                image: Some("img".into()),
+                providers: vec![json!({ "provider": "local" })],
+                ..Default::default()
+            };
+            let job = $call!(Client::with_settings(fake.settings()).submit_job(&spec)).unwrap();
+            let lines: Vec<String> = $call!(job.logs(None))
+                .unwrap()
+                .into_iter()
+                .map(|line| line["m"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(lines, vec!["line 0", "line 1", "line 2"]);
+        });
+
+        // Surface beyond CASES.md: the rest of the API both modes share.
+
+        $case!(surface_client_app_and_workflow_share_the_client, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let app = client.app("embed");
+            assert_eq!(app.name, "embed");
+            let mut call = $call!(app.enqueue(json!({ "n": 2 }))).unwrap();
+            assert!(!call.id.is_empty());
+            let id = call.id.clone();
+            assert_eq!($call!(call.get()).unwrap()["id"], json!(id));
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": { "n": 2 } }));
+            let flow = client.workflow("pipeline");
+            let call = $call!(flow.enqueue(json!({ "q": "x" }))).unwrap();
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap()["a"]["echo"], json!({ "q": "x" }));
+        });
+
+        $case!(surface_enqueue_with_callback_still_runs, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let call = $call!(client.enqueue_with_callback("embed", json!({ "n": 3 }), "https://example.test/hook")).unwrap();
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": { "n": 3 } }));
+        });
+
+        $case!(surface_job_by_id_and_run_job, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let spec = JobSpec {
+                entrypoint: Some("echo hi".into()),
+                image: Some("img".into()),
+                providers: vec![json!({ "provider": "local" })],
+                ..Default::default()
+            };
+            let submitted = $call!(client.submit_job(&spec)).unwrap();
+            let mut again = $call!(client.job(&submitted.id)).unwrap();
+            assert_eq!(again.id, submitted.id);
+            assert!(!again.status().is_empty());
+            $call!(again.get()).unwrap();
+            let done = $call!(client.run_job(&spec, Duration::from_millis(50), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(done["status"], "succeeded");
+        });
+
+        $case!(surface_volume_list_info_and_download, {
+            let Some(fake) = start() else { return };
+            fake.make_volume("weights");
+            fake.seed("weights", "m/a", "aaa");
+            fake.seed("weights", "m/sub/b", "bbb");
+            let names: Vec<Value> = $call!(Volume::list(fake.settings())).unwrap().into_iter().map(|row| row["name"].clone()).collect();
+            assert_eq!(names, vec![json!("weights")]);
+            let weights = Volume::with_settings("weights", fake.settings());
+            assert_eq!($call!(weights.info()).unwrap()["name"], "weights");
+            let dest = temp("download");
+            $call!(weights.path("m/").download(&dest)).unwrap();
+            assert_eq!(std::fs::read_to_string(dest.join("a")).unwrap(), "aaa");
+            assert_eq!(std::fs::read_to_string(dest.join("sub/b")).unwrap(), "bbb");
+        });
+    };
 }
 
-#[tokio::test]
-async fn v02_large_upload_goes_in_parts() {
-    let Some(fake) = start() else { return };
-    let dir = temp("v02");
-    let data: Vec<u8> = (0..(PART * 3 + 17)).map(|n| (n * 7 % 251) as u8).collect();
-    std::fs::write(dir.join("big.bin"), &data).unwrap();
-    let weights = fake.volume("weights").await;
-    weights.put_file(dir.join("big.bin"), "big.bin").await.unwrap();
-    assert_eq!(weights.read("big.bin").await.unwrap(), data);
-    assert!(fake.requests().await.iter().any(|item| item["path"].as_str().unwrap().ends_with("/uploads")));
-}
+mod async_cases {
+    use super::*;
+    use std::time::Duration;
+    use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
 
-#[tokio::test]
-async fn v03_put_directory_keeps_relative_paths() {
-    let Some(fake) = start() else { return };
-    let dir = temp("v03");
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    std::fs::write(dir.join("a"), "a").unwrap();
-    std::fs::write(dir.join("sub/b"), "b").unwrap();
-    assert_eq!(fake.volume("weights").await.put_directory(&dir, "minilm/").await.unwrap(), 2);
-    let files = fake.state().await["files"]["weights"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-    assert_eq!(files, vec!["minilm/a", "minilm/sub/b"]);
-}
-
-#[tokio::test]
-async fn v04_ls_lists_one_level_or_everything() {
-    let Some(fake) = start() else { return };
-    let weights = fake.volume("weights").await;
-    for path in ["m/a", "m/sub/b", "top"] {
-        fake.seed("weights", path, "x").await;
+    macro_rules! call {
+        ($e:expr) => {
+            $e.await
+        };
     }
-    let top: Vec<String> = weights.ls("m/", false).await.unwrap().into_iter().map(|entry| entry.path).collect();
-    assert_eq!(top, vec!["m/a", "m/sub/"]);
-    let mut all: Vec<String> = weights.ls("", true).await.unwrap().into_iter().map(|entry| entry.path).collect();
-    all.sort();
-    assert_eq!(all, vec!["m/a", "m/sub/b", "top"]);
-}
 
-#[tokio::test]
-async fn v05_local_downloads_once() {
-    let Some(fake) = start() else { return };
-    let weights = fake.volume("weights").await;
-    fake.seed("weights", "m/a", "aaa").await;
-    fake.seed("weights", "m/b", "bbb").await;
-    let path = weights.path("m/").local().await.unwrap();
-    assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "aaa");
-    assert_eq!(std::fs::read_to_string(path.join("b")).unwrap(), "bbb");
-    let before = fake.requests().await.len();
-    weights.path("m/").local().await.unwrap();
-    assert_eq!(fake.requests().await.len(), before);
-}
-
-#[tokio::test]
-async fn v06_a_new_object_fetches_only_changes() {
-    let Some(fake) = start() else { return };
-    fake.volume("weights").await;
-    fake.seed("weights", "m/a", "aaa").await;
-    fake.seed("weights", "m/b", "bbb").await;
-    Volume::with_settings("weights", fake.settings()).path("m/").local().await.unwrap();
-    fake.seed("weights", "m/a", "AAAA").await;
-    fake.http
-        .post(format!("{}/v1/weights/delete", fake.url))
-        .bearer_auth("sfk_test")
-        .json(&json!({ "paths": ["m/b"] }))
-        .send()
-        .await
-        .unwrap();
-    let downloads = fake.state().await["downloads"].as_u64().unwrap();
-    let path = Volume::with_settings("weights", fake.settings()).path("m/").local().await.unwrap();
-    assert_eq!(fake.state().await["downloads"].as_u64().unwrap(), downloads + 1);
-    assert_eq!(std::fs::read_to_string(path.join("a")).unwrap(), "AAAA");
-    assert!(!path.join("b").exists());
-}
-
-#[tokio::test]
-async fn v07_commit_uploads_changes_and_deletes() {
-    let Some(fake) = start() else { return };
-    let ckpts = fake.volume("ckpts").await;
-    for path in ["r/a", "r/b", "r/c"] {
-        fake.seed("ckpts", path, path).await;
+    macro_rules! case {
+        ($name:ident, $body:block) => {
+            #[tokio::test]
+            async fn $name() $body
+        };
     }
-    let folder = ckpts.path("r/").local_with(Mode::ReadWrite, false).await.unwrap();
-    std::fs::write(folder.join("a"), "changed!").unwrap();
-    std::fs::write(folder.join("d"), "new").unwrap();
-    std::fs::remove_file(folder.join("c")).unwrap();
-    let done = ckpts.commit().await.unwrap();
-    assert_eq!((done.uploaded, done.deleted), (2, 1));
-    let files = fake.state().await["files"]["ckpts"].clone();
-    assert_eq!(files.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), vec!["r/a", "r/b", "r/d"]);
-    assert_eq!(files["r/a"]["body"], "changed!");
-    let again = ckpts.commit().await.unwrap();
-    assert_eq!((again.uploaded, again.deleted), (0, 0));
+
+    cases!(case, call);
 }
 
-#[tokio::test]
-async fn v08_open_write_uploads_on_close_only() {
-    let Some(fake) = start() else { return };
-    let results = fake.volume("results").await;
-    let mut done = results.writer("runs/1.jsonl");
-    done.write_all(b"one\n");
-    done.finish().await.unwrap();
-    {
-        let mut abandoned = results.writer("runs/2.jsonl");
-        abandoned.write_all(b"partial");
-        // Dropped without finish: nothing is uploaded.
+/// The blocking API, with no runtime around it.
+#[cfg(feature = "blocking")]
+mod blocking_cases {
+    use super::*;
+    use std::time::Duration;
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+
+    macro_rules! call {
+        ($e:expr) => {
+            $e
+        };
     }
-    let files = fake.state().await["files"]["results"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-    assert_eq!(files, vec!["runs/1.jsonl"]);
-}
 
-#[tokio::test]
-async fn v09_rm_file_and_folder() {
-    let Some(fake) = start() else { return };
-    let weights = fake.volume("weights").await;
-    for path in ["a", "old/x", "old/y"] {
-        fake.seed("weights", path, "x").await;
+    macro_rules! case {
+        ($name:ident, $body:block) => {
+            #[test]
+            fn $name() $body
+        };
     }
-    weights.rm("a").await.unwrap();
-    assert_eq!(weights.rm_recursive("old/").await.unwrap(), 2);
-    assert!(fake.state().await["files"]["weights"].as_object().unwrap().is_empty());
+
+    cases!(case, call);
 }
 
-#[tokio::test]
-async fn v10_missing_file_raises_404() {
-    let Some(fake) = start() else { return };
-    match fake.volume("weights").await.read("nope").await {
-        Err(Error::Api { status: 404, detail }) => assert!(detail.contains("no such file")),
-        other => panic!("expected a 404, got {other:?}"),
+/// The blocking API called from inside a current-thread Tokio runtime: it must not panic.
+#[cfg(feature = "blocking")]
+mod blocking_in_current_thread {
+    use super::*;
+    use std::time::Duration;
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+
+    macro_rules! call {
+        ($e:expr) => {
+            $e
+        };
     }
-}
 
-#[tokio::test]
-async fn v11_token_file_wins_over_the_api_key() {
-    let Some(fake) = start() else { return };
-    fake.volume("weights").await;
-    let dir = temp("v11");
-    std::fs::write(dir.join("token"), "aaa.bbb.ccc\n").unwrap();
-    let settings = Settings {
-        token_file: Some(dir.join("token")),
-        ..fake.settings()
-    };
-    Volume::with_settings("weights", settings).ls("", false).await.unwrap();
-    assert_eq!(fake.requests().await.last().unwrap()["auth"], "Bearer aaa.bbb.ccc");
-}
-
-#[tokio::test]
-async fn v12_no_credential_says_what_to_set() {
-    let Some(fake) = start() else { return };
-    let settings = Settings {
-        env_api_key: None,
-        ..fake.settings()
-    };
-    match Volume::with_settings("weights", settings).ls("", false).await {
-        Err(error @ Error::Credential(_)) => assert!(error.to_string().contains("SURFRA_API_KEY")),
-        other => panic!("expected a credential error, got {other:?}"),
+    macro_rules! case {
+        ($name:ident, $body:block) => {
+            #[tokio::test(flavor = "current_thread")]
+            async fn $name() $body
+        };
     }
+
+    cases!(case, call);
 }
 
-#[tokio::test]
-async fn v13_writing_to_a_new_volume_creates_it() {
-    let Some(fake) = start() else { return };
-    Volume::with_settings("fresh", fake.settings()).write("a.txt", "x").await.unwrap();
-    assert_eq!(fake.state().await["files"]["fresh"]["a.txt"]["body"], "x");
-}
+/// The blocking API called from inside a multi-thread Tokio runtime: it must not panic.
+#[cfg(feature = "blocking")]
+mod blocking_in_multi_thread {
+    use super::*;
+    use std::time::Duration;
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
 
-#[tokio::test]
-async fn v14_another_sdks_state_file_is_honored() {
-    let Some(fake) = start() else { return };
-    fake.volume("weights").await;
-    fake.seed("weights", "m/a", "aaa").await;
-    let local = fake.cache.join("vol-weights/m/a");
-    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-    std::fs::write(&local, "aaa").unwrap();
-    let meta = std::fs::metadata(&local).unwrap();
-    let mtime_ns = {
-        use std::os::unix::fs::MetadataExt;
-        meta.mtime() as u64 * 1_000_000_000 + meta.mtime_nsec() as u64
-    };
-    let etag = fake.state().await["files"]["weights"]["m/a"]["etag"].clone();
-    std::fs::create_dir_all(fake.cache.join(".state")).unwrap();
-    std::fs::write(
-        fake.cache.join(".state/vol-weights.json"),
-        json!({ "m/a": { "etag": etag, "size": 3, "mtime_ns": mtime_ns } }).to_string(),
-    )
-    .unwrap();
-    Volume::with_settings("weights", fake.settings()).path("m/").local().await.unwrap();
-    assert_eq!(fake.state().await["downloads"], 0);
-}
+    macro_rules! call {
+        ($e:expr) => {
+            $e
+        };
+    }
 
-#[tokio::test]
-async fn a01_run_returns_the_output() {
-    let Some(fake) = start() else { return };
-    let output = Client::with_settings(fake.settings())
-        .run("embed", json!({ "texts": ["hi"] }), Some(Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert_eq!(output, json!({ "app": "embed", "echo": { "texts": ["hi"] } }));
-}
+    macro_rules! case {
+        ($name:ident, $body:block) => {
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn $name() $body
+        };
+    }
 
-#[tokio::test]
-async fn a06_submit_a_graph_and_wait() {
-    let Some(fake) = start() else { return };
-    let client = Client::with_settings(fake.settings());
-    let view = client
-        .submit(
-            json!([
-                { "name": "a", "app_name": "embed", "depends_on": [], "input": { "n": 1 } },
-                { "name": "b", "app_name": "rerank", "depends_on": ["a"], "input": {} }
-            ]),
-            json!({}),
-        )
-        .await
-        .unwrap();
-    let out = Call::new(client, view).result(Some(Duration::from_secs(30))).await.unwrap();
-    assert_eq!(out, json!({ "a": { "app": "embed", "echo": { "n": 1 } }, "b": { "app": "rerank", "echo": {} } }));
-}
-
-#[tokio::test]
-async fn a02_enqueue_then_result() {
-    let Some(fake) = start() else { return };
-    let client = Client::with_settings(fake.settings());
-    let call = client.enqueue("embed", json!({ "n": 1 })).await.unwrap();
-    assert_eq!(
-        call.result(Some(Duration::from_secs(30))).await.unwrap(),
-        json!({ "app": "embed", "echo": { "n": 1 } })
-    );
-    let failed = client.enqueue("fails", json!({})).await.unwrap().result(Some(Duration::from_secs(30))).await;
-    assert!(matches!(failed, Err(Error::Failed(reason)) if reason.contains("ValueError")));
-}
-
-#[tokio::test]
-async fn j01_job_with_volumes_finishes() {
-    let Some(fake) = start() else { return };
-    let spec = JobSpec {
-        entrypoint: Some("python train.py".into()),
-        image: Some("img".into()),
-        providers: vec![json!({ "provider": "local" })],
-        volumes: vec![Volume::new("weights").grant(Mode::Read)],
-        ..Default::default()
-    };
-    let mut job = Client::with_settings(fake.settings()).submit_job(&spec).await.unwrap();
-    assert_eq!(fake.state().await["jobs"][&job.id]["volumes"], json!(["weights:r"]));
-    let view = job.wait(Duration::from_millis(50), Some(Duration::from_secs(30))).await.unwrap().clone();
-    assert_eq!(view["status"], "succeeded");
-    assert_eq!(view["exit_code"], 0);
-}
-
-#[tokio::test]
-async fn v15_write_and_read_helpers() {
-    let Some(fake) = start() else { return };
-    let weights = fake.volume("weights").await;
-    weights.write("bytes.bin", vec![0u8, 1, b'r', b'a', b'w']).await.unwrap();
-    assert_eq!(weights.read("bytes.bin").await.unwrap(), vec![0u8, 1, b'r', b'a', b'w']);
-}
-
-#[tokio::test]
-async fn c01_control_plane_calls_skip_the_volumes_token() {
-    let Some(fake) = start() else { return };
-    let dir = temp("c01");
-    std::fs::write(dir.join("token"), "aaa.bbb.ccc").unwrap();
-    let settings = Settings {
-        token_file: Some(dir.join("token")),
-        ..fake.settings()
-    };
-    let weights = Volume::with_settings("weights", settings.clone());
-    weights.create().await.unwrap();
-    weights.ls("", false).await.unwrap();
-    Client::with_settings(settings)
-        .run("embed", json!({}), Some(Duration::from_secs(30)))
-        .await
-        .unwrap();
-    let sent: std::collections::HashMap<String, String> = fake
-        .requests()
-        .await
-        .into_iter()
-        .map(|item| (item["path"].as_str().unwrap().to_string(), item["auth"].as_str().unwrap_or("").to_string()))
-        .collect();
-    assert_eq!(sent["/v1/volumes"], "Bearer sfk_test");
-    assert_eq!(sent["/v1/transactions"], "Bearer sfk_test");
-    assert_eq!(sent["/v1/weights/list"], "Bearer aaa.bbb.ccc");
-}
-
-#[tokio::test]
-async fn a03_app_deploy_sends_the_spec() {
-    let Some(fake) = start() else { return };
-    let app = App::with_client("embed", Client::with_settings(fake.settings()));
-    let spec = AppSpec {
-        image: "ghcr.io/acme/embed:1".into(),
-        entrypoint: "app.py".into(),
-        autoscale: Some(json!({ "max_replicas": 2 })),
-        runtime: Some(json!({ "engine": "python" })),
-        ..Default::default()
-    };
-    let saved = app.deploy(&spec).await.unwrap();
-    assert_eq!(saved["name"], "embed");
-    assert!(saved["id"].as_str().unwrap().starts_with("sfa_"));
-    assert_eq!(saved["image"], "ghcr.io/acme/embed:1");
-    assert_eq!(saved["autoscale"], json!({ "max_replicas": 2 }));
-    assert!(
-        fake.requests()
-            .await
-            .iter()
-            .any(|item| item["method"] == "PUT" && item["path"] == "/v1/apps/embed")
-    );
-}
-
-#[tokio::test]
-async fn a04_app_run_and_volumes() {
-    let Some(fake) = start() else { return };
-    let app = App::with_client("embed", Client::with_settings(fake.settings()));
-    assert_eq!(
-        app.run(json!({ "x": 1 }), Some(Duration::from_secs(30))).await.unwrap(),
-        json!({ "app": "embed", "echo": { "x": 1 } })
-    );
-    app.set_volumes(&["weights:r"]).await.unwrap();
-    assert_eq!(app.volumes().await.unwrap(), json!([{ "volume": "weights", "mode": "r" }]));
-}
-
-#[tokio::test]
-async fn a05_a_rate_limited_submit_waits_and_succeeds() {
-    let Some(fake) = start() else { return };
-    let output = Client::with_settings(fake.settings())
-        .run("busy", json!({ "n": 1 }), Some(Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert_eq!(output, json!({ "app": "busy", "echo": { "n": 1 } }));
-    assert_eq!(fake.requests().await.iter().filter(|item| item["path"] == "/v1/transactions").count(), 2);
-}
-
-#[tokio::test]
-async fn w01_workflow_run_returns_each_stage() {
-    let Some(fake) = start() else { return };
-    let out = Workflow::with_client("pipeline", Client::with_settings(fake.settings()))
-        .run(json!({ "q": "hi" }), Some(Duration::from_secs(30)))
-        .await
-        .unwrap();
-    assert_eq!(
-        out,
-        json!({ "a": { "app": "embed", "echo": { "q": "hi" } }, "b": { "app": "rerank", "echo": {} } })
-    );
-}
-
-#[tokio::test]
-async fn w02_workflow_deploy_saves_stages() {
-    let Some(fake) = start() else { return };
-    let flow = Workflow::with_client("solo", Client::with_settings(fake.settings()));
-    flow.deploy(json!([{ "name": "only", "app": "embed", "depends": [] }])).await.unwrap();
-    let out = flow.run(json!({ "q": "hi" }), Some(Duration::from_secs(30))).await.unwrap();
-    assert_eq!(out, json!({ "app": "embed", "echo": { "q": "hi" } }));
-}
-
-#[tokio::test]
-async fn j02_job_logs_oldest_first() {
-    let Some(fake) = start() else { return };
-    let spec = JobSpec {
-        entrypoint: Some("echo hi".into()),
-        image: Some("img".into()),
-        providers: vec![json!({ "provider": "local" })],
-        ..Default::default()
-    };
-    let job = Client::with_settings(fake.settings()).submit_job(&spec).await.unwrap();
-    let lines: Vec<String> = job
-        .logs(None)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|line| line["m"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(lines, vec!["line 0", "line 1", "line 2"]);
+    cases!(case, call);
 }

@@ -9,6 +9,14 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result, checked};
 use crate::settings::Settings;
 
+/// Characters an id may keep in a URL path segment; everything else is percent-encoded.
+const ID: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+
+/// An id or name as one URL path segment.
+fn segment(id: &str) -> percent_encoding::PercentEncode<'_> {
+    percent_encoding::utf8_percent_encode(id, ID)
+}
+
 /// The control plane. Clones share one connection pool.
 #[derive(Clone)]
 pub struct Client {
@@ -42,7 +50,17 @@ impl Client {
 
     /// Start a transaction. Over the organization's request rate, waits as Surfra asks, up to five times.
     pub async fn submit(&self, stages: Value, metadata: Value) -> Result<Value> {
-        let body = json!({ "stages": stages, "metadata": metadata });
+        self.post_transaction(json!({ "stages": stages, "metadata": metadata })).await
+    }
+
+    /// [`Client::submit`] with a `callback_url`. Surfra stores it with the transaction; delivering
+    /// status changes to it is planned and not yet live.
+    pub async fn submit_with_callback(&self, stages: Value, metadata: Value, callback_url: &str) -> Result<Value> {
+        self.post_transaction(json!({ "stages": stages, "metadata": metadata, "callback_url": callback_url }))
+            .await
+    }
+
+    async fn post_transaction(&self, body: Value) -> Result<Value> {
         for attempt in 0..=RATE_RETRIES {
             let response = self
                 .http
@@ -68,13 +86,14 @@ impl Client {
 
     /// Queue one call to an app and return it before the app finishes.
     pub async fn enqueue(&self, app: &str, input: Value) -> Result<Call> {
-        let stages = json!([{ "name": "call", "app_name": app, "depends_on": [], "input": input }]);
-        let view = self.submit(stages, json!({})).await?;
-        Ok(Call {
-            client: self.clone(),
-            id: view["id"].as_str().unwrap_or_default().to_string(),
-            view,
-        })
+        let view = self.submit(one_call(app, input), json!({})).await?;
+        Ok(Call::new(self.clone(), view))
+    }
+
+    /// [`Client::enqueue`] with a `callback_url`. Surfra stores it; delivery is planned and not yet live.
+    pub async fn enqueue_with_callback(&self, app: &str, input: Value, callback_url: &str) -> Result<Call> {
+        let view = self.submit_with_callback(one_call(app, input), json!({}), callback_url).await?;
+        Ok(Call::new(self.clone(), view))
     }
 
     /// Call an app and wait for its output.
@@ -94,14 +113,32 @@ impl Client {
         })
     }
 
+    /// Run a command once on one machine, and wait for it to end. Returns the job's final view.
+    pub async fn run_job(&self, job: &JobSpec, interval: Duration, timeout: Option<Duration>) -> Result<Value> {
+        let mut job = self.submit_job(job).await?;
+        Ok(job.wait(interval, timeout).await?.clone())
+    }
+
     /// A job by id.
     pub async fn job(&self, id: &str) -> Result<Job> {
-        let view = self.call(Method::GET, &format!("/v1/jobs/{id}"), None).await?;
+        let view = self.call(Method::GET, &format!("/v1/jobs/{}", segment(id)), None).await?;
         Ok(Job {
             client: self.clone(),
             id: id.to_string(),
             view,
         })
+    }
+}
+
+impl Client {
+    /// A deployed app by name, sharing this client. No request is made until it is used.
+    pub fn app(&self, name: impl Into<String>) -> App {
+        App::with_client(name, self.clone())
+    }
+
+    /// A saved workflow by name, sharing this client. No request is made until it is used.
+    pub fn workflow(&self, name: impl Into<String>) -> Workflow {
+        Workflow::with_client(name, self.clone())
     }
 }
 
@@ -112,6 +149,10 @@ impl Default for Client {
 }
 
 const RATE_RETRIES: u32 = 5;
+
+fn one_call(app: &str, input: Value) -> Value {
+    json!([{ "name": "call", "app_name": app, "depends_on": [], "input": input }])
+}
 
 /// A deployed app by name. No request is made until it is used.
 #[derive(Clone)]
@@ -264,12 +305,16 @@ pub struct Call {
 impl Call {
     /// Track a call from the view `Client::submit` returned.
     pub fn new(client: Client, view: Value) -> Self {
-        Call { client, id: view["id"].as_str().unwrap_or_default().to_string(), view }
+        Call {
+            client,
+            id: view["id"].as_str().unwrap_or_default().to_string(),
+            view,
+        }
     }
 
     /// Refresh and return the call's current view.
     pub async fn get(&mut self) -> Result<&Value> {
-        self.view = self.client.call(Method::GET, &format!("/v1/transactions/{}", self.id), None).await?;
+        self.view = self.client.call(Method::GET, &format!("/v1/transactions/{}", segment(&self.id)), None).await?;
         Ok(&self.view)
     }
 
@@ -353,12 +398,15 @@ impl Job {
     }
 
     pub async fn get(&mut self) -> Result<&Value> {
-        self.view = self.client.call(Method::GET, &format!("/v1/jobs/{}", self.id), None).await?;
+        self.view = self.client.call(Method::GET, &format!("/v1/jobs/{}", segment(&self.id)), None).await?;
         Ok(&self.view)
     }
 
     pub async fn stop(&mut self) -> Result<&Value> {
-        self.view = self.client.call(Method::POST, &format!("/v1/jobs/{}/stop", self.id), Some(&json!({}))).await?;
+        self.view = self
+            .client
+            .call(Method::POST, &format!("/v1/jobs/{}/stop", segment(&self.id)), Some(&json!({})))
+            .await?;
         Ok(&self.view)
     }
 
@@ -367,7 +415,7 @@ impl Job {
         let mut out = Vec::new();
         let mut cursor = after.map(str::to_string);
         loop {
-            let mut route = format!("/v1/jobs/{}/logs?limit=1000&order=asc", self.id);
+            let mut route = format!("/v1/jobs/{}/logs?limit=1000&order=asc", segment(&self.id));
             if let Some(stamp) = &cursor {
                 route.push_str(&format!(
                     "&after={}",

@@ -15,6 +15,8 @@
 //! Credentials come from the environment, in Surfra's order: the volumes token Surfra gives apps and
 //! jobs (`SURFRA_VOLUMES_TOKEN_FILE`), `SURFRA_API_KEY`, `SURFRA_REPLICA_TOKEN`, then the session saved
 //! by `surfra login`. See [`Settings`] to set them in code.
+//!
+//! Without async, enable the `blocking` feature: `surfra::blocking` has the same names, minus `.await`.
 
 mod client;
 mod error;

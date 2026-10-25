@@ -4,7 +4,7 @@ The Surfra SDK for Rust: volumes, apps and jobs on serverless GPUs across your o
 
 ```toml
 [dependencies]
-surfra = "0.1"
+surfra = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
@@ -34,7 +34,33 @@ async fn main() -> surfra::Result<()> {
 }
 ```
 
-Without an async runtime, enable the `blocking` feature and use `surfra::blocking::Volume`, which has the same methods.
+## Without async
+
+Enable the `blocking` feature and use `surfra::blocking`. It has the same types and methods as the async
+API (`Client`, `App`, `Workflow`, `Call`, `Job`, `Volume`, `VolumePath`, `Upload`), minus the `.await`:
+
+```toml
+surfra = { version = "0.2", features = ["blocking"] }
+```
+
+```rust
+use std::time::Duration;
+use surfra::blocking::{Client, Volume};
+
+fn main() -> surfra::Result<()> {
+    let model_dir = Volume::new("weights").path("minilm/").local()?;
+
+    let client = Client::new();
+    let call = client.app("embed").enqueue(serde_json::json!({ "texts": ["hello"] }))?;
+    println!("queued {}", call.id);
+    let output = call.result(Some(Duration::from_secs(600)))?;
+    Ok(())
+}
+```
+
+Every blocking call runs on one shared multi-thread Tokio runtime, started on first use. Calling it from
+inside a Tokio runtime does not panic (the call runs on a helper thread while the caller waits), but it
+still blocks that thread, so async code should use the async API.
 
 ## Apps and jobs
 

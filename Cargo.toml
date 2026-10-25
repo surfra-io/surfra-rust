@@ -1,6 +1,6 @@
 [package]
 name = "surfra"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Surfra SDK: volumes, apps and jobs on serverless GPUs across your own clouds"
@@ -14,8 +14,8 @@ categories = ["api-bindings", "filesystem"]
 
 [features]
 default = []
-# A synchronous API for code without an async runtime.
-blocking = ["tokio/rt", "tokio/net"]
+# `surfra::blocking`: the same API without async, over one shared multi-thread runtime.
+blocking = ["tokio/rt", "tokio/rt-multi-thread", "tokio/net"]
 
 [dependencies]
 futures-util = "0.3"
@@ -26,4 +26,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["fs", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time", "rt", "rt-multi-thread", "net", "macros"] }
+
+[[example]]
+name = "container"
+required-features = ["blocking"]
