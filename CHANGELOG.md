@@ -13,8 +13,11 @@ All notable changes to this crate are documented here. The format follows
   `call.view` are reachable through `Deref`.
 - `Client::app` and `Client::workflow`, sharing the client's connection pool.
 - `Client::run_job` in the async API (it was blocking-only).
-- `Client::submit_with_callback` and `Client::enqueue_with_callback`. Surfra stores the `callback_url`;
-  delivering status changes to it is planned.
+- `Client::submit_with_callback` and `Client::enqueue_with_callback`. Surfra POSTs the task's latest
+  state to the `callback_url` each time it changes.
+- `surfra::webhooks` (also `surfra::blocking::webhooks`): `verify`, `verify_at` and `verify_headers` check a
+  callback's `X-Surfra-Signature` (HMAC-SHA256, several `v1=` during secret rotation, 300 s tolerance)
+  and return the parsed body.
 
 ### Changed
 - The blocking API runs on one shared multi-thread Tokio runtime instead of one runtime per object, and

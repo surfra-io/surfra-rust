@@ -53,8 +53,8 @@ impl Client {
         self.post_transaction(json!({ "stages": stages, "metadata": metadata })).await
     }
 
-    /// [`Client::submit`] with a `callback_url`. Surfra stores it with the transaction; delivering
-    /// status changes to it is planned and not yet live.
+    /// [`Client::submit`] with a `callback_url`. Surfra POSTs the task's latest
+    /// state there each time it changes. Check callbacks with [`crate::webhooks`].
     pub async fn submit_with_callback(&self, stages: Value, metadata: Value, callback_url: &str) -> Result<Value> {
         self.post_transaction(json!({ "stages": stages, "metadata": metadata, "callback_url": callback_url }))
             .await
@@ -90,7 +90,7 @@ impl Client {
         Ok(Call::new(self.clone(), view))
     }
 
-    /// [`Client::enqueue`] with a `callback_url`. Surfra stores it; delivery is planned and not yet live.
+    /// [`Client::enqueue`] with a `callback_url`. Surfra POSTs the task's latest state there each time it changes.
     pub async fn enqueue_with_callback(&self, app: &str, input: Value, callback_url: &str) -> Result<Call> {
         let view = self.submit_with_callback(one_call(app, input), json!({}), callback_url).await?;
         Ok(Call::new(self.clone(), view))

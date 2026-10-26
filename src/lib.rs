@@ -17,11 +17,14 @@
 //! by `surfra login`. See [`Settings`] to set them in code.
 //!
 //! Without async, enable the `blocking` feature: `surfra::blocking` has the same names, minus `.await`.
+//!
+//! To check that a callback really came from Surfra, see [`webhooks`].
 
 mod client;
 mod error;
 mod settings;
 pub mod volumes;
+pub mod webhooks;
 
 #[cfg(feature = "blocking")]
 pub mod blocking;

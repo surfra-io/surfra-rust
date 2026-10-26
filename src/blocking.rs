@@ -27,6 +27,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
+/// Callback signature verification; it does no I/O, so it is the same module as [`crate::webhooks`].
+pub use crate::webhooks;
 pub use crate::{AppSpec, Committed, Entry, Error, JobSpec, Mode, Result, Settings};
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
@@ -87,7 +89,7 @@ impl Client {
         wait(self.inner.submit(stages, metadata))
     }
 
-    /// Start a transaction with a `callback_url`. Surfra stores it; delivery is planned and not yet live.
+    /// Start a transaction with a `callback_url`. Surfra POSTs the task's latest state there each time it changes.
     pub fn submit_with_callback(&self, stages: Value, metadata: Value, callback_url: &str) -> Result<Value> {
         wait(self.inner.submit_with_callback(stages, metadata, callback_url))
     }
@@ -97,7 +99,7 @@ impl Client {
         wait(self.inner.enqueue(app, input)).map(Call::from)
     }
 
-    /// [`Client::enqueue`] with a `callback_url`. Surfra stores it; delivery is planned and not yet live.
+    /// [`Client::enqueue`] with a `callback_url`. Surfra POSTs the task's latest state there each time it changes.
     pub fn enqueue_with_callback(&self, app: &str, input: Value, callback_url: &str) -> Result<Call> {
         wait(self.inner.enqueue_with_callback(app, input, callback_url)).map(Call::from)
     }

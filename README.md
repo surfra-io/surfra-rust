@@ -86,6 +86,22 @@ async fn train() -> surfra::Result<()> {
 }
 ```
 
+## Verify callbacks
+
+Callbacks to a `callback_url` carry an `X-Surfra-Signature` header. Check it against the raw body before
+trusting the payload; pass every active secret while rotating one:
+
+```rust
+fn on_callback(body: &[u8], headers: &reqwest::header::HeaderMap) -> Result<(), surfra::webhooks::WebhookError> {
+    let event = surfra::webhooks::verify_headers(body, headers, &["whsec_new", "whsec_old"])?;
+    println!("{} seq {}", event["type"], event["seq"]);
+    Ok(())
+}
+```
+
+A signature more than 5 minutes from your clock is rejected as a replay. `surfra::blocking::webhooks` is
+the same module.
+
 ## Credentials
 
 Inside a Surfra app or job nothing needs setting: `SURFRA_VOLUMES_URL` is a local proxy that adds the

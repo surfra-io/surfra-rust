@@ -479,6 +479,30 @@ macro_rules! cases {
             assert_eq!(lines, vec!["line 0", "line 1", "line 2"]);
         });
 
+        $case!(h01_callback_signatures_match_the_vectors, {
+            let Some(dir) = suite() else { return };
+            let vectors: Value = serde_json::from_slice(&std::fs::read(dir.join("webhooks.json")).unwrap()).unwrap();
+            let tolerance = Duration::from_secs(vectors["tolerance_seconds"].as_u64().unwrap());
+            assert_eq!(tolerance, webhooks::TOLERANCE);
+            let cases = vectors["cases"].as_array().unwrap();
+            assert!(!cases.is_empty());
+            for case in cases {
+                let name = case["name"].as_str().unwrap();
+                let result = webhooks::verify_at(
+                    case["body"].as_str().unwrap().as_bytes(),
+                    case["signature"].as_str().unwrap(),
+                    &[case["secret"].as_str().unwrap()],
+                    case["now"].as_i64().unwrap(),
+                    tolerance,
+                );
+                if case["ok"].as_bool().unwrap() {
+                    assert_eq!(result.unwrap_or_else(|error| panic!("{name}: {error}"))["seq"], 7, "{name}");
+                } else {
+                    assert!(result.is_err(), "{name}: expected a rejection, got {result:?}");
+                }
+            }
+        });
+
         // Surface beyond CASES.md: the rest of the API both modes share.
 
         $case!(surface_client_app_and_workflow_share_the_client, {
@@ -541,7 +565,7 @@ macro_rules! cases {
 mod async_cases {
     use super::*;
     use std::time::Duration;
-    use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+    use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -564,7 +588,7 @@ mod async_cases {
 mod blocking_cases {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -587,7 +611,7 @@ mod blocking_cases {
 mod blocking_in_current_thread {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -610,7 +634,7 @@ mod blocking_in_current_thread {
 mod blocking_in_multi_thread {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
