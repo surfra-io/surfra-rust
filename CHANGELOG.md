@@ -3,6 +3,13 @@
 All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-10-26
+
+### Added
+- `surfra::webhooks` (also `surfra::blocking::webhooks`): `verify`, `verify_at` and `verify_headers` check a
+  callback's `X-Surfra-Signature` (HMAC-SHA256, several `v1=` during secret rotation, 300 s tolerance)
+  and return the parsed body.
+
 ## [0.2.0] - 2026-10-25
 
 ### Added
@@ -15,9 +22,6 @@ All notable changes to this crate are documented here. The format follows
 - `Client::run_job` in the async API (it was blocking-only).
 - `Client::submit_with_callback` and `Client::enqueue_with_callback`. Surfra POSTs the task's latest
   state to the `callback_url` each time it changes.
-- `surfra::webhooks` (also `surfra::blocking::webhooks`): `verify`, `verify_at` and `verify_headers` check a
-  callback's `X-Surfra-Signature` (HMAC-SHA256, several `v1=` during secret rotation, 300 s tolerance)
-  and return the parsed body.
 
 ### Changed
 - The blocking API runs on one shared multi-thread Tokio runtime instead of one runtime per object, and
