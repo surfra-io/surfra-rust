@@ -102,6 +102,47 @@ fn on_callback(body: &[u8], headers: &reqwest::header::HeaderMap) -> Result<(), 
 A signature more than 5 minutes from your clock is rejected as a replay. `surfra::blocking::webhooks` is
 the same module.
 
+## Errors and retries
+
+When Surfra can't take work right now, it refuses with a typed error and queues nothing, so every
+request retries it for you, after the `Retry-After` Surfra sends. This works in async and in
+`surfra::blocking` alike.
+
+| Status | `Error::error_type()` | Retried? |
+| --- | --- | --- |
+| 429 | `RATE_LIMITED`: your organization's per-minute limit | yes |
+| 503 | `QUEUE_FULL`: the app's queue is as long as its machines can clear soon | yes |
+| 503 | `SERVER_BUSY`: Surfra is short of database connections | yes |
+| 503 | `APP_PAUSED`, `DEFCON_ACTIVE`: the app is paused, or the kill switch is on | no |
+| 402 | `HTTP_CALLS_LIMIT`: this month's included HTTP calls are used up and the organization has no card on file. Add one in Settings, or wait for the month to turn | no |
+| 502/503/504 with no Surfra error | `None` | only reads (`GET`) |
+| a connection that never got through | `None` | yes |
+| other 4xx | | no |
+
+**Limits:** at most 7 retries (8 attempts) within 3 minutes of the first try. Without `Retry-After`, the
+waits back off exponentially with jitter (0.5 s base, 30 s cap). Change the limits per client, or for some calls:
+
+```rust
+use surfra::{Client, RetryPolicy};
+use std::time::Duration;
+
+let client = Client::new().with_retry(
+    RetryPolicy { max_retries: 3, deadline: Duration::from_secs(30), ..RetryPolicy::default() }
+        .on_retry(|event| eprintln!("surfra: {event}")),
+);
+client.with_retry(RetryPolicy::none()).submit(stages, metadata).await?;   // this call is never retried
+```
+
+`App`, `Workflow` and `Volume` have `with_retry` too.
+
+**The final error:** `Error` gives `status()`, `error_type()`, `message()`, `attempts()` and `retry_after()`.
+
+**When the outcome is unknown:** a submission (a transaction or a job) that got a 504, or lost its
+connection after it was sent, is never retried, because it may already be running. It returns
+`Error::OutcomeUnknown` (`outcome_unknown()` is true).
+- Check for the work before submitting again.
+- For long work, prefer `enqueue` then `result`, or a callback URL, over one long call.
+
 ## Credentials
 
 Inside a Surfra app or job nothing needs setting: `SURFRA_VOLUMES_URL` is a local proxy that adds the

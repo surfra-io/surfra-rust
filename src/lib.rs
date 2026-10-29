@@ -22,6 +22,7 @@
 
 mod client;
 mod error;
+mod retry;
 mod settings;
 pub mod volumes;
 pub mod webhooks;
@@ -31,5 +32,24 @@ pub mod blocking;
 
 pub use client::{App, AppSpec, Call, Client, Job, JobSpec, Workflow};
 pub use error::{Error, Result};
+pub use retry::{RetryEvent, RetryPolicy};
 pub use settings::Settings;
 pub use volumes::{Committed, Entry, Mode, Upload, Volume, VolumePath};
+
+/// Surfra-Client: surfra-rust/<crate version>, sent on every request so the control plane can trace errors to a release.
+pub const CLIENT: &str = concat!("surfra-rust/", env!("CARGO_PKG_VERSION"));
+
+pub(crate) fn client_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("surfra-client", reqwest::header::HeaderValue::from_static(CLIENT));
+    headers
+}
+
+#[cfg(test)]
+mod client_header_tests {
+    #[test]
+    fn the_client_header_names_this_crate_and_its_version() {
+        assert_eq!(super::CLIENT, format!("surfra-rust/{}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(super::client_headers()["surfra-client"], super::CLIENT);
+    }
+}

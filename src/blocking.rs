@@ -29,7 +29,7 @@ use tokio::runtime::Runtime;
 
 /// Callback signature verification; it does no I/O, so it is the same module as [`crate::webhooks`].
 pub use crate::webhooks;
-pub use crate::{AppSpec, Committed, Entry, Error, JobSpec, Mode, Result, Settings};
+pub use crate::{AppSpec, Committed, Entry, Error, JobSpec, Mode, Result, RetryEvent, RetryPolicy, Settings};
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -82,6 +82,13 @@ impl Client {
     /// The async client this wraps.
     pub fn as_async(&self) -> &crate::Client {
         &self.inner
+    }
+
+    /// The same client with another retry policy. See [`crate::Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> Client {
+        Client {
+            inner: self.inner.with_retry(policy),
+        }
     }
 
     /// Start a transaction. See [`crate::Client::submit`].
@@ -169,6 +176,13 @@ impl App {
         App::with_client(name, Client::with_settings(settings))
     }
 
+    /// The same app with another retry policy. See [`crate::Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> App {
+        App {
+            inner: self.inner.with_retry(policy),
+        }
+    }
+
     /// Create the app, or update the app with this name.
     pub fn deploy(&self, spec: &AppSpec) -> Result<Value> {
         wait(self.inner.deploy(spec))
@@ -228,6 +242,13 @@ impl Workflow {
     /// The workflow with its own client from `settings`.
     pub fn with_settings(name: impl Into<String>, settings: Settings) -> Self {
         Workflow::with_client(name, Client::with_settings(settings))
+    }
+
+    /// The same workflow with another retry policy. See [`crate::Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> Workflow {
+        Workflow {
+            inner: self.inner.with_retry(policy),
+        }
     }
 
     /// Save the stages. See [`crate::Workflow::deploy`].
@@ -355,6 +376,13 @@ impl Volume {
     /// The async volume this wraps. It shares this volume's sync record.
     pub fn as_async(&self) -> &crate::Volume {
         &self.inner
+    }
+
+    /// The same volume with another retry policy. See [`crate::Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> Volume {
+        Volume {
+            inner: self.inner.with_retry(policy),
+        }
     }
 
     pub fn name(&self) -> &str {

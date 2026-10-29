@@ -19,13 +19,14 @@ use std::sync::Arc;
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::error::{Error, Result, checked};
+use crate::error::{Error, Result};
+use crate::retry::{self, Kind, RetryPolicy};
 use crate::settings::Settings;
 
 const DOWNLOADS: usize = 8;
@@ -114,6 +115,7 @@ pub struct Volume {
     settings: Arc<Settings>,
     http: reqwest::Client,
     synced: Arc<Mutex<HashMap<String, Mode>>>,
+    retry: RetryPolicy,
 }
 
 /// A file or folder inside a volume. A trailing slash means a folder.
@@ -164,10 +166,18 @@ impl Volume {
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
                 .read_timeout(std::time::Duration::from_secs(300))
+                .default_headers(crate::client_headers())
                 .build()
                 .expect("an HTTP client"),
             synced: Arc::new(Mutex::new(HashMap::new())),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// The same volume (sharing its connections and sync record) with another retry policy.
+    /// See [`crate::Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> Volume {
+        Volume { retry: policy, ..self.clone() }
     }
 
     pub fn name(&self) -> &str {
@@ -191,15 +201,20 @@ impl Volume {
         format!("{}/v1/{}/{}", self.settings.volumes_url, utf8_percent_encode(&self.name, SEGMENT), route)
     }
 
+    /// One request to the volumes service, retried as [`RetryPolicy`] says. An error answer comes back as
+    /// [`Error::Api`]; a success comes back unread, so downloads stream.
     async fn send(&self, method: Method, url: &str, body: Option<Vec<u8>>, json_body: Option<&Value>, query: &[(&str, &str)]) -> Result<reqwest::Response> {
-        let mut request = self.http.request(method, url).bearer_auth(self.settings.credential()?).query(query);
-        if let Some(data) = body {
-            request = request.header(reqwest::header::CONTENT_LENGTH, data.len()).body(data);
-        }
-        if let Some(value) = json_body {
-            request = request.json(value);
-        }
-        Ok(request.send().await?)
+        let build = || {
+            let mut request = self.http.request(method.clone(), url).bearer_auth(self.settings.credential()?).query(query);
+            if let Some(data) = &body {
+                request = request.header(reqwest::header::CONTENT_LENGTH, data.len()).body(data.clone());
+            }
+            if let Some(value) = json_body {
+                request = request.json(value);
+            }
+            Ok(request)
+        };
+        retry::run(&self.retry, method.clone(), url, Kind::Plain, build, |response| async move { Ok(response) }).await
     }
 
     /// A request to the volumes service. Writes to a volume that does not exist yet create it first.
@@ -213,30 +228,25 @@ impl Volume {
         create: bool,
     ) -> Result<reqwest::Response> {
         let url = self.files_url(route);
-        let response = self.send(method.clone(), &url, body.clone(), json_body.as_ref(), query).await?;
-        if create && response.status() == StatusCode::NOT_FOUND {
-            let text = response.text().await.unwrap_or_default();
-            if text.contains("no volume") {
+        match self.send(method.clone(), &url, body.clone(), json_body.as_ref(), query).await {
+            Err(Error::Api { status: 404, ref detail, .. }) if create && detail.contains("no volume") => {
                 self.create().await?;
-                return checked(self.send(method, &url, body, json_body.as_ref(), query).await?).await;
+                self.send(method, &url, body, json_body.as_ref(), query).await
             }
-            return Err(Error::Api {
-                status: 404,
-                detail: detail_of(&text),
-            });
+            other => other,
         }
-        checked(response).await
     }
 
     async fn control(&self, method: Method, route: &str, body: Option<Value>) -> Result<Value> {
-        let mut request = self
-            .http
-            .request(method, format!("{}{}", self.settings.master, route))
-            .bearer_auth(self.settings.control_credential()?);
-        if let Some(value) = &body {
-            request = request.json(value);
-        }
-        Ok(checked(request.send().await?).await?.json().await?)
+        let url = format!("{}{}", self.settings.master, route);
+        let build = || {
+            let mut request = self.http.request(method.clone(), &url).bearer_auth(self.settings.control_credential()?);
+            if let Some(value) = &body {
+                request = request.json(value);
+            }
+            Ok(request)
+        };
+        retry::buffered(&self.retry, method.clone(), &url, Kind::Plain, build).await?.json()
     }
 
     /// Create the volume. Writing to a volume that does not exist yet does this for you.
@@ -477,13 +487,13 @@ impl Volume {
     }
 
     async fn head(&self, path: &str) -> Result<Vec<Entry>> {
-        let response = self
+        let response = match self
             .send(Method::HEAD, &self.files_url(&format!("files/{}", encode(path))), None, None, &[])
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
-        }
-        let response = checked(response).await?;
+            .await
+        {
+            Err(Error::Api { status: 404, .. }) => return Ok(Vec::new()),
+            other => other?,
+        };
         let header = |name: &str| response.headers().get(name).and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
         Ok(vec![Entry {
             path: path.to_string(),
@@ -725,17 +735,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn detail_of(text: &str) -> String {
-    serde_json::from_str::<Value>(text)
-        .ok()
-        .and_then(|body| {
-            body.get("error")
-                .or_else(|| body.get("detail"))
-                .and_then(|value| value.as_str().map(str::to_string))
-        })
-        .unwrap_or_else(|| text.to_string())
 }
 
 fn unique() -> u64 {

@@ -6,7 +6,8 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::error::{Error, Result, checked};
+use crate::error::{Error, Result};
+use crate::retry::{self, Kind, RetryPolicy};
 use crate::settings::Settings;
 
 /// Characters an id may keep in a URL path segment; everything else is percent-encoded.
@@ -22,6 +23,7 @@ fn segment(id: &str) -> percent_encoding::PercentEncode<'_> {
 pub struct Client {
     settings: Settings,
     http: reqwest::Client,
+    retry: RetryPolicy,
 }
 
 impl Client {
@@ -33,22 +35,44 @@ impl Client {
     pub fn with_settings(settings: Settings) -> Self {
         Client {
             settings,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(60)).build().expect("an HTTP client"),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .default_headers(crate::client_headers())
+                .build()
+                .expect("an HTTP client"),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// The same client (sharing its connection pool) with another retry policy. Use it once for one
+    /// call, `client.with_retry(RetryPolicy::none()).submit(...)`, or keep it as the client.
+    pub fn with_retry(&self, policy: RetryPolicy) -> Client {
+        Client { retry: policy, ..self.clone() }
+    }
+
+    /// The retry policy every request from this client follows.
+    pub fn retry_policy(&self) -> &RetryPolicy {
+        &self.retry
     }
 
     async fn call(&self, method: Method, route: &str, body: Option<&Value>) -> Result<Value> {
-        let mut request = self
-            .http
-            .request(method, format!("{}{}", self.settings.master, route))
-            .bearer_auth(self.settings.control_credential()?);
-        if let Some(value) = body {
-            request = request.json(value);
-        }
-        Ok(checked(request.send().await?).await?.json().await?)
+        self.send(method, route, body, Kind::Plain).await
     }
 
-    /// Start a transaction. Over the organization's request rate, waits as Surfra asks, up to five times.
+    async fn send(&self, method: Method, route: &str, body: Option<&Value>, kind: Kind) -> Result<Value> {
+        let url = format!("{}{}", self.settings.master, route);
+        let build = || {
+            let mut request = self.http.request(method.clone(), &url).bearer_auth(self.settings.control_credential()?);
+            if let Some(value) = body {
+                request = request.json(value);
+            }
+            Ok(request)
+        };
+        retry::buffered(&self.retry, method.clone(), &url, kind, build).await?.json()
+    }
+
+    /// Start a transaction. Overload answers are retried as the client's [`RetryPolicy`] says; a `504`
+    /// or a lost connection after it was sent returns [`Error::OutcomeUnknown`] instead, since it may be running.
     pub async fn submit(&self, stages: Value, metadata: Value) -> Result<Value> {
         self.post_transaction(json!({ "stages": stages, "metadata": metadata })).await
     }
@@ -61,27 +85,7 @@ impl Client {
     }
 
     async fn post_transaction(&self, body: Value) -> Result<Value> {
-        for attempt in 0..=RATE_RETRIES {
-            let response = self
-                .http
-                .post(format!("{}/v1/transactions", self.settings.master))
-                .bearer_auth(self.settings.control_credential()?)
-                .json(&body)
-                .send()
-                .await?;
-            if response.status().as_u16() != 429 || attempt == RATE_RETRIES {
-                return Ok(checked(response).await?.json().await?);
-            }
-            let wait = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or(1.0)
-                .clamp(1.0, 60.0);
-            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
-        }
-        unreachable!("the loop returns on its last attempt")
+        self.send(Method::POST, "/v1/transactions", Some(&body), Kind::Submission).await
     }
 
     /// Queue one call to an app and return it before the app finishes.
@@ -104,7 +108,12 @@ impl Client {
     /// Run a command once on one machine.
     pub async fn submit_job(&self, job: &JobSpec) -> Result<Job> {
         let view = self
-            .call(Method::POST, "/v1/jobs", Some(&serde_json::to_value(job).expect("a job is JSON")))
+            .send(
+                Method::POST,
+                "/v1/jobs",
+                Some(&serde_json::to_value(job).expect("a job is JSON")),
+                Kind::Submission,
+            )
             .await?;
         Ok(Job {
             client: self.clone(),
@@ -148,8 +157,6 @@ impl Default for Client {
     }
 }
 
-const RATE_RETRIES: u32 = 5;
-
 fn one_call(app: &str, input: Value) -> Value {
     json!([{ "name": "call", "app_name": app, "depends_on": [], "input": input }])
 }
@@ -184,6 +191,14 @@ impl App {
 
     pub fn with_client(name: impl Into<String>, client: Client) -> Self {
         App { name: name.into(), client }
+    }
+
+    /// The same app with another retry policy. See [`Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> App {
+        App {
+            name: self.name.clone(),
+            client: self.client.with_retry(policy),
+        }
     }
 
     fn route(&self, rest: &str) -> String {
@@ -246,6 +261,14 @@ impl Workflow {
 
     pub fn with_client(name: impl Into<String>, client: Client) -> Self {
         Workflow { name: name.into(), client }
+    }
+
+    /// The same workflow with another retry policy. See [`Client::with_retry`].
+    pub fn with_retry(&self, policy: RetryPolicy) -> Workflow {
+        Workflow {
+            name: self.name.clone(),
+            client: self.client.with_retry(policy),
+        }
     }
 
     /// Save the stages, such as `json!([{ "name": "summarize", "app": "summarize", "depends": ["transcribe"] }])`.

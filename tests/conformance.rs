@@ -125,6 +125,18 @@ impl Fake {
         })
     }
 
+    /// Answer the next matching requests with a fault (see server.py, POST /_test/faults).
+    fn faults(&self, items: Value) {
+        self.post("/_test/faults", None, json!({ "faults": items }));
+    }
+
+    fn count(&self, method: &str, prefix: &str) -> usize {
+        self.requests()
+            .iter()
+            .filter(|item| item["method"] == method && item["path"].as_str().unwrap().starts_with(prefix))
+            .count()
+    }
+
     fn requests(&self) -> Vec<Value> {
         self.state()["log"]
             .as_array()
@@ -134,6 +146,19 @@ impl Fake {
             .cloned()
             .collect()
     }
+}
+
+/// A typed refusal like the control plane's: {"detail", "error": {"type", "message", "retry_after"}} and Retry-After.
+fn refusal(method: &str, path: &str, status: u16, kind: &str, retry_after: Option<u64>) -> Value {
+    let mut fault = json!({
+        "method": method, "path": path, "status": status,
+        "body": { "detail": kind.to_lowercase(), "error": { "type": kind, "message": kind.to_lowercase() } },
+    });
+    if let Some(seconds) = retry_after {
+        fault["body"]["error"]["retry_after"] = json!(seconds);
+        fault["headers"] = json!({ "Retry-After": seconds.to_string() });
+    }
+    fault
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -280,7 +305,7 @@ macro_rules! cases {
             let Some(fake) = start() else { return };
             fake.make_volume("weights");
             match $call!(Volume::with_settings("weights", fake.settings()).read("nope")) {
-                Err(Error::Api { status: 404, detail }) => assert!(detail.contains("no such file")),
+                Err(Error::Api { status: 404, detail, .. }) => assert!(detail.contains("no such file")),
                 other => panic!("expected a 404, got {other:?}"),
             }
         });
@@ -559,13 +584,147 @@ macro_rules! cases {
             assert_eq!(std::fs::read_to_string(dest.join("a")).unwrap(), "aaa");
             assert_eq!(std::fs::read_to_string(dest.join("sub/b")).unwrap(), "bbb");
         });
+
+        $case!(r01_rate_limited_waits_retry_after_then_succeeds, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 429, "RATE_LIMITED", Some(1))]));
+            let started = std::time::Instant::now();
+            let output = $call!(Client::with_settings(fake.settings()).run("embed", json!({ "n": 1 }), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(output, json!({ "app": "embed", "echo": { "n": 1 } }));
+            assert!(started.elapsed() >= Duration::from_millis(900));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 2);
+        });
+
+        $case!(r02_queue_full_is_retried, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 503, "QUEUE_FULL", Some(0))]));
+            let output = $call!(Client::with_settings(fake.settings()).run("embed", json!({}), Some(Duration::from_secs(30)))).unwrap();
+            assert_eq!(output, json!({ "app": "embed", "echo": {} }));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 2);
+        });
+
+        $case!(r03_server_busy_on_a_get_is_retried, {
+            let Some(fake) = start() else { return };
+            let call = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({ "n": 3 }))).unwrap();
+            fake.faults(json!([refusal("GET", "/v1/transactions/", 503, "SERVER_BUSY", Some(0))]));
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": { "n": 3 } }));
+        });
+
+        $case!(r04_app_paused_is_not_retried, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 503, "APP_PAUSED", None)]));
+            let error = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!((error.status(), error.error_type(), error.attempts()), (Some(503), Some("APP_PAUSED"), 1));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 1);
+        });
+
+        $case!(r05_defcon_active_is_not_retried, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 503, "DEFCON_ACTIVE", None)]));
+            let error = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!(error.error_type(), Some("DEFCON_ACTIVE"));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 1);
+        });
+
+        $case!(r13_http_calls_limit_is_not_retried, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 402, "HTTP_CALLS_LIMIT", None)]));
+            let error = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!((error.status(), error.error_type(), error.attempts()), (Some(402), Some("HTTP_CALLS_LIMIT"), 1));
+            assert!(!error.message().is_empty());
+            assert_eq!(fake.count("POST", "/v1/transactions"), 1);
+        });
+
+        $case!(r06_a_plain_502_is_retried_on_get_only, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let call = $call!(client.enqueue("embed", json!({}))).unwrap();
+            fake.faults(json!([{ "method": "GET", "path": "/v1/transactions/", "status": 502, "raw": "<html>bad gateway</html>" }]));
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": {} }));
+            fake.faults(json!([{ "method": "POST", "path": "/v1/transactions", "status": 502, "raw": "<html>bad gateway</html>" }]));
+            let error = $call!(client.enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!((error.status(), error.error_type(), error.outcome_unknown()), (Some(502), None, false));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 2);
+        });
+
+        $case!(r07_a_plain_504_on_a_submit_is_an_unknown_outcome, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([{ "method": "POST", "path": "/v1/transactions", "status": 504, "raw": "upstream timed out" }]));
+            let error = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({}))).err().unwrap();
+            assert!(error.outcome_unknown());
+            assert_eq!(error.status(), Some(504));
+            assert!(error.to_string().contains("may be running"), "{error}");
+            assert_eq!(fake.count("POST", "/v1/transactions"), 1);
+        });
+
+        $case!(r08_a_dropped_connection_is_retried_on_get_only, {
+            let Some(fake) = start() else { return };
+            let client = Client::with_settings(fake.settings());
+            let call = $call!(client.enqueue("embed", json!({}))).unwrap();
+            fake.faults(json!([{ "method": "GET", "path": "/v1/transactions/", "drop": true }]));
+            assert_eq!($call!(call.result(Some(Duration::from_secs(30)))).unwrap(), json!({ "app": "embed", "echo": {} }));
+            fake.faults(json!([{ "method": "POST", "path": "/v1/transactions", "drop": true }]));
+            let error = $call!(client.enqueue("embed", json!({}))).err().unwrap();
+            assert!(error.outcome_unknown(), "{error}");
+            assert!(error.to_string().contains("may be running"), "{error}");
+            assert_eq!(fake.count("POST", "/v1/transactions"), 2);
+        });
+
+        $case!(r09_a_400_is_not_retried, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([{ "method": "POST", "path": "/v1/transactions", "status": 400, "body": { "detail": "stages must be a list" } }]));
+            let error = $call!(Client::with_settings(fake.settings()).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!((error.status(), error.attempts()), (Some(400), 1));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 1);
+        });
+
+        $case!(r10_a_refused_connection_is_retried, {
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let settings = Settings {
+                master: format!("http://127.0.0.1:{port}"),
+                env_api_key: Some("sfk_test".into()),
+                api_key: None,
+                token_file: None,
+                login_file: None,
+                replica_token: None,
+                ..Settings::from_env()
+            };
+            let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = attempts.clone();
+            let policy = RetryPolicy { max_retries: 2, ..RetryPolicy::default() }.on_retry(move |event| seen.lock().unwrap().push(event.attempt));
+            let error = $call!(Client::with_settings(settings).with_retry(policy).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!(error.attempts(), 3, "{error}");
+            assert!(!error.outcome_unknown());
+            assert_eq!(*attempts.lock().unwrap(), vec![1, 2]);
+        });
+
+        $case!(r11_retries_stop_after_max_retries, {
+            let Some(fake) = start() else { return };
+            let mut fault = refusal("POST", "/v1/transactions", 503, "SERVER_BUSY", Some(0));
+            fault["times"] = json!(10);
+            fake.faults(json!([fault]));
+            let policy = RetryPolicy { max_retries: 2, ..RetryPolicy::default() };
+            let error = $call!(Client::with_settings(fake.settings()).with_retry(policy).enqueue("embed", json!({}))).err().unwrap();
+            assert_eq!((error.error_type(), error.attempts()), (Some("SERVER_BUSY"), 3));
+            assert_eq!(fake.count("POST", "/v1/transactions"), 3);
+        });
+
+        $case!(r12_a_wait_past_the_deadline_is_not_taken, {
+            let Some(fake) = start() else { return };
+            fake.faults(json!([refusal("POST", "/v1/transactions", 429, "RATE_LIMITED", Some(30))]));
+            let policy = RetryPolicy { deadline: Duration::from_secs(2), ..RetryPolicy::default() };
+            let started = std::time::Instant::now();
+            let error = $call!(Client::with_settings(fake.settings()).with_retry(policy).enqueue("embed", json!({}))).err().unwrap();
+            assert!(started.elapsed() < Duration::from_millis(1500));
+            assert_eq!((error.error_type(), error.retry_after(), error.attempts()), (Some("RATE_LIMITED"), Some(Duration::from_secs(30)), 1));
+        });
     };
 }
 
 mod async_cases {
     use super::*;
     use std::time::Duration;
-    use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
+    use surfra::{App, AppSpec, Call, Client, Error, JobSpec, Mode, RetryPolicy, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -588,7 +747,7 @@ mod async_cases {
 mod blocking_cases {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, RetryPolicy, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -611,7 +770,7 @@ mod blocking_cases {
 mod blocking_in_current_thread {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, RetryPolicy, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
@@ -634,7 +793,7 @@ mod blocking_in_current_thread {
 mod blocking_in_multi_thread {
     use super::*;
     use std::time::Duration;
-    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, Settings, Volume, Workflow, webhooks};
+    use surfra::blocking::{App, AppSpec, Call, Client, Error, JobSpec, Mode, RetryPolicy, Settings, Volume, Workflow, webhooks};
 
     macro_rules! call {
         ($e:expr) => {
