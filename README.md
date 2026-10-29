@@ -4,7 +4,7 @@ The Surfra SDK for Rust: volumes, apps and jobs on serverless GPUs across your o
 
 ```toml
 [dependencies]
-surfra = "0.2"
+surfra = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```

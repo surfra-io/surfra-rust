@@ -3,7 +3,7 @@
 All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crate follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-29
 
 ### Added
 - Every request sends `Surfra-Client: surfra-rust/<version>`, so the control plane can trace errors to a release.
